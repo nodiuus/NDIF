@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="DBI/DBI.vcxproj" Id="b388a254-0749-4faf-bdca-3b2438153ddd" />
+  <Project Path="DBI/plugins/framework_showcase/framework_showcase.vcxproj" Id="b9b586aa-3246-4fa4-8d80-3e82203f709e" />
+  <Project Path="dbi_agent/dbi_agent.vcxproj" Id="29cc4dd8-375d-48a3-b45e-66776dfd3e0a" />
+</Solution>

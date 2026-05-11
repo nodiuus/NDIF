@@ -1,0 +1,16 @@
+{
+  "name": "ndif",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "imgui",
+      "features": [
+        "dx11-binding",
+        "win32-binding"
+      ]
+    },
+    "lief",
+    "nlohmann-json",
+    "zydis"
+  ]
+}

@@ -1,0 +1,13 @@
+<Project>
+  <PropertyGroup>
+    <UseRepoVcpkgIntegration Condition="'$(UseRepoVcpkgIntegration)' == '' and '$(VcpkgRoot)' != ''">true</UseRepoVcpkgIntegration>
+    <UseRepoVcpkgIntegration Condition="'$(UseRepoVcpkgIntegration)' == '' and '$(VCPKG_ROOT)' != ''">true</UseRepoVcpkgIntegration>
+    <VcpkgRoot Condition="'$(UseRepoVcpkgIntegration)' == 'true' and '$(VcpkgRoot)' == ''">$(VCPKG_ROOT)</VcpkgRoot>
+    <VCPkgLocalAppDataDisabled Condition="'$(UseRepoVcpkgIntegration)' == 'true'">true</VCPkgLocalAppDataDisabled>
+    <VcpkgEnableManifest Condition="'$(VcpkgEnableManifest)' == ''">true</VcpkgEnableManifest>
+    <VcpkgTriplet Condition="'$(VcpkgTriplet)' == '' and '$(Platform)' == 'x64'">x64-windows-static</VcpkgTriplet>
+  </PropertyGroup>
+
+  <Import Project="$(VcpkgRoot)\scripts\buildsystems\msbuild\vcpkg.props"
+          Condition="'$(UseRepoVcpkgIntegration)' == 'true' and Exists('$(VcpkgRoot)\scripts\buildsystems\msbuild\vcpkg.props')" />
+</Project>
