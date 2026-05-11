@@ -1,3 +1,7 @@
+/*
+    A test DLL meant to show off the frameworks capabilities.
+*/
+
 #include <Windows.h>
 
 #include <cstdint>
