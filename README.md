@@ -6,6 +6,8 @@ This repository is a public alpha for Windows x64 dynamic binary instrumentation
 
 The alpha is intentionally small: it ships the DBI core/CLI, one sample plugin, and the minimal in-target agent DLL. Larger research projects and detector zoos are kept out of the public solution for now.
 
+I've made a lot of plugins / tools using this framework, I may release them later for public use.
+
 ## Public Alpha Scope
 
 Included in `DBI.slnx`:
