@@ -1,6 +1,8 @@
 # NDIF
 
-NDIF is Nisan's Dynamic Instrumentation Framework. This repository is a public alpha for Windows x64 dynamic binary instrumentation experiments.
+NDIF stands for "Nisan's Dynamic Instrumentation Framework" (yes I skipped the "binary" part for a cooler name, deal with it). 
+
+This repository is a public alpha for Windows x64 dynamic binary instrumentation experiments.
 
 The alpha is intentionally small: it ships the DBI core/CLI, one sample plugin, and the minimal in-target agent DLL. Larger research projects and detector zoos are kept out of the public solution for now.
 
