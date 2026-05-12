@@ -1,6 +1,6 @@
 # NDIF
 
-NDIF stands for "Nisan's Dynamic Instrumentation Framework" (yes I skipped the "binary" part for a cooler name, deal with it). 
+NDIF stands for "Nisan's Dynamic Instrumentation Framework" (yes I skipped the "binary" part for a cooler name). 
 
 This repository is a public alpha for Windows x64 dynamic binary instrumentation experiments.
 
