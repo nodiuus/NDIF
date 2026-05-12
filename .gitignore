@@ -389,3 +389,4 @@ FodyWeavers.xsd
 /anti_tamper_test_exe/anti_tamper_test_exe.vcxproj.filters
 /test_exe/test_exe.vcxproj
 /test_exe/test_exe.vcxproj.filters
+/hook.log.txt
