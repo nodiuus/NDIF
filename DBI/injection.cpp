@@ -142,7 +142,7 @@ namespace injection {
             std::printf("failed to open process\n");
             return false;
         }
-        //TODO: implement weird manual mapping horseshit
+        //TODO: implement weird manual mapping stuff
 
         return false;
     }
