@@ -14,3 +14,6 @@ Controller command
 - `DBI.exe -i <pid>`
 - `DBI.exe -i <pid> <section_name>`
 - `DBI.exe -i <pid> <module_name> <section_name>`
+
+TODO:
+  - Add websocket support
