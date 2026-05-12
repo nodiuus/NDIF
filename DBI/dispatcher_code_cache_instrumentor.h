@@ -730,11 +730,7 @@ private:
         if (src_instruction == nullptr || dst_instruction == nullptr || instruction_len == 0) {
             return false;
         }
-        if ((bit_offset % 8) != 0 || (bit_size % 8) != 0) {
-            return false;
-        }
-
-        const std::size_t byte_offset = static_cast<std::size_t>(bit_offset / 8);
+        const std::size_t byte_offset = static_cast<std::size_t>(bit_offset);
         const std::size_t byte_size = static_cast<std::size_t>(bit_size / 8);
         if (byte_size == 0 || (byte_offset + byte_size) > instruction_len) {
             return false;

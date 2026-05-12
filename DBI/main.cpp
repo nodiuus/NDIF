@@ -1,3 +1,4 @@
+#include "basic_block_code_cache.h"
 #include "dynamic_binary_instrumentor.h"
 #include "dbi_framework.h"
 #include "external_process_instrumentor.h"
@@ -77,6 +78,8 @@ bool try_parse_ptr(const wchar_t* text, std::uintptr_t& value) {
     value = static_cast<std::uintptr_t>(temp);
     return true;
 }
+
+using translated_demo_fn = int(__cdecl*)(int);
 
 std::string to_lower_ascii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](char c) {
@@ -899,6 +902,72 @@ int run_instruction_callback_demo() {
     return hits == 64 ? 0 : 1;
 }
 
+int run_translated_cache_demo() {
+    basic_block_code_cache cache{};
+    std::unordered_map<std::uintptr_t, std::size_t> hit_counts{};
+    std::mutex hit_lock{};
+
+    if (!cache.add_callback([&](const instrumented_instruction& instruction, CONTEXT&) {
+            std::lock_guard<std::mutex> guard(hit_lock);
+            ++hit_counts[instruction.address];
+        })) {
+        std::cerr << "translated cache demo: add callback failed\n";
+        return 1;
+    }
+
+    const std::uint8_t demo_code[] = {
+        0x83, 0xF9, 0x0A,       // cmp ecx, 10
+        0x7D, 0x04,             // jge +4
+        0x8D, 0x41, 0x01,       // lea eax, [rcx+1]
+        0xC3,                   // ret
+        0x8D, 0x41, 0x02,       // lea eax, [rcx+2]
+        0xC3                    // ret
+    };
+
+    void* demo_memory = VirtualAlloc(nullptr, sizeof(demo_code), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (demo_memory == nullptr) {
+        std::cerr << "translated cache demo: VirtualAlloc failed\n";
+        return 1;
+    }
+    std::memcpy(demo_memory, demo_code, sizeof(demo_code));
+    FlushInstructionCache(GetCurrentProcess(), demo_memory, sizeof(demo_code));
+
+    const auto demo_entry = reinterpret_cast<std::uintptr_t>(demo_memory);
+    translated_demo_fn native = reinterpret_cast<translated_demo_fn>(demo_memory);
+    translated_demo_fn translated = cache.translate_function<translated_demo_fn>(demo_entry);
+    if (translated == nullptr) {
+        std::cerr << "translated cache demo: translate failed: " << cache.last_error() << "\n";
+        VirtualFree(demo_memory, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    int native_total = 0;
+    int translated_total = 0;
+    for (int i = 0; i < 256; ++i) {
+        native_total += native(i);
+        translated_total += translated(i);
+    }
+
+    std::vector<std::pair<std::uintptr_t, std::size_t>> sorted_hits(hit_counts.begin(), hit_counts.end());
+    std::sort(
+        sorted_hits.begin(),
+        sorted_hits.end(),
+        [](const auto& lhs, const auto& rhs) {
+            return lhs.second > rhs.second;
+        });
+
+    std::cout << "translated cache demo: native_total=" << native_total << " translated_total=" << translated_total << "\n";
+    std::cout << "demo_target entry=0x" << std::hex << demo_entry << std::dec << "\n";
+    std::cout << "translated instruction hits (top 8):\n";
+    for (std::size_t i = 0; i < std::min<std::size_t>(sorted_hits.size(), 8); ++i) {
+        std::cout << "  0x" << std::hex << sorted_hits[i].first << std::dec << " -> " << sorted_hits[i].second << "\n";
+    }
+
+    const bool ok = native_total == translated_total && !hit_counts.empty();
+    VirtualFree(demo_memory, 0, MEM_RELEASE);
+    return ok ? 0 : 1;
+}
+
 int run_list_plugins(plugin_manager& plugins) {
     const auto infos = plugins.list_loaded_plugins();
     std::cout << "loaded plugins (" << infos.size() << "):\n";
@@ -1042,6 +1111,9 @@ int wmain(int argc, wchar_t* argv[]) {
     if (arg_is(cmd, {L"--instruction-callback-demo", L"--inline-cache-demo"})) {
         return run_instruction_callback_demo();
     }
+    if (arg_is(cmd, {L"--translated-cache-demo", L"--bb-cache-demo"})) {
+        return run_translated_cache_demo();
+    }
     if (cmd != nullptr) {
         return run_external_executable(argc - index, argv + index, plugins);
     }
@@ -1058,6 +1130,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"       DBI.exe --patch-nop <pid> <address> <count>\n";
     std::wcout << L"       DBI.exe --self-patch-demo\n";
     std::wcout << L"       DBI.exe --instruction-callback-demo\n";
+    std::wcout << L"       DBI.exe --translated-cache-demo\n";
     std::wcout << L"       DBI.exe -l                                       (# --list-plugins)\n";
     std::wcout << L"       DBI.exe -c <command> [args...]                  (# --cmd)\n";
     std::wcout << L"global options:\n";

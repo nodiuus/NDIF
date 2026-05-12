@@ -58,6 +58,7 @@ Basic forms:
 ```powershell
 DBI.exe <target.exe> [args...]
 DBI.exe --instruction-callback-demo
+DBI.exe --translated-cache-demo
 DBI.exe -l
 DBI.exe -p framework_showcase -c showcase.help
 DBI.exe -p framework_showcase -c showcase.ping
@@ -87,6 +88,7 @@ The current agent is an MVP handshake path: it connects to `\\.\pipe\dbi_agent_<
 Primary public C++ surfaces live under `DBI/`:
 
 - `dbi_framework.*`: high-level framework wrapper.
+- `basic_block_code_cache.h`: translated basic-block cache prototype for cache-owned function execution.
 - `dynamic_binary_instrumentor.*`: in-process instrumentation coordinator.
 - `dispatcher_code_cache_instrumentor.h`: non-mutating hardware-breakpoint redirect backend. Registered addresses execute through generated cache blocks while the original bytes stay readable and intact.
 - `external_process_instrumentor.*`: debugger-driven external process instrumentation.
@@ -96,6 +98,8 @@ Primary public C++ surfaces live under `DBI/`:
 - `dbi_host.*`: host wrapper around plugin manager and default plugin discovery.
 
 The default in-process instruction callback engine uses hardware execute breakpoints as entry traps, catches matching execution with a VEH, and redirects matching instruction pointers to a generated code-cache block. The cache block preserves CPU state, calls registered callbacks, executes relocated original bytes, then jumps back to the original continuation. It does not rewrite or hide the target instruction bytes.
+
+The translated basic-block cache prototype is a separate #4-style path: callers enter a translated function entry directly, and direct branch targets are resolved into translated blocks on demand. It is the path intended to grow toward DynamoRIO/PIN-style cache-owned execution.
 
 ## Sample Plugin
 
@@ -117,6 +121,7 @@ Commands:
 - Public alpha, not a stable API promise.
 - Windows x64 is the real target. x86 project configurations may exist but are not the alpha support target.
 - The default hardware-breakpoint code-cache backend instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
+- The translated basic-block cache is an early prototype. It supports ordinary instructions, returns, and direct conditional/unconditional branches; unsupported indirect control flow can still leave the cache.
 - Callback `CONTEXT` includes x64 integer registers and flags. Edits to general-purpose registers and flags are applied before relocated bytes resume; edits to `RIP`/`RSP` are not applied yet.
 - Some injection/agent paths are experimental and should be treated as lab tooling.
 - Build/test coverage is manual right now; CI is not wired yet.

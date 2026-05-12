@@ -41,6 +41,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="basic_block_code_cache.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="dynamic_binary_instrumentor.h">
       <Filter>Header Files</Filter>
     </ClInclude>

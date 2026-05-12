@@ -141,6 +141,7 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="basic_block_code_cache.h" />
     <ClInclude Include="dynamic_binary_instrumentor.h" />
     <ClInclude Include="dispatcher_code_cache_instrumentor.h" />
     <ClInclude Include="external_process_instrumentor.h" />
