@@ -57,6 +57,9 @@ __declspec(dllexport) int start() {
 
     const bool enabled = ndif->enable_instruction_callbacks();
     std::printf("[*] enable_instruction_callbacks: %s\n", enabled ? "true" : "false");
+    if (!enabled) {
+        std::printf("[-] backend error: %s\n", ndif->last_instruction_error());
+    }
     return enabled ? 1 : 0;
 }
 

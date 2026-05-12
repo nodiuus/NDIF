@@ -81,7 +81,9 @@ public:
         DWORD timeout_ms,
         external_instrumentation_result& out_result);
 
-    // In-process translated code-cache instrumentation.
+    // In-process instruction callbacks. Default backend redirects hardware
+    // execute-breakpoint hits into a generated code-cache copy without modifying
+    // or hiding target bytes.
     int instrument_instruction_with_status(std::uintptr_t address);
     bool instrument_instruction(std::uintptr_t address);
     bool add_instruction_callback(std::function<void(CONTEXT& ctx, std::uintptr_t ip)> callback);

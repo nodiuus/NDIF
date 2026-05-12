@@ -852,12 +852,12 @@ int run_self_patch_demo() {
     return 0;
 }
 
-int run_inline_cache_demo() {
+int run_instruction_callback_demo() {
     dbi_framework framework{};
     dbi_framework_options options{};
     options.enable_plugins = false;
     if (!framework.initialize(options)) {
-        std::cerr << "inline cache demo: framework init failed\n";
+        std::cerr << "instruction callback demo: framework init failed\n";
         return 1;
     }
 
@@ -871,7 +871,7 @@ int run_inline_cache_demo() {
 
     std::size_t hits = 0;
     if (!framework.instrument_instruction(demo_start)) {
-        std::cerr << "inline cache demo: instrument_instruction failed\n";
+        std::cerr << "instruction callback demo: instrument_instruction failed\n";
         return 1;
     }
     if (!framework.add_instruction_callback([&](CONTEXT&, std::uintptr_t ip) {
@@ -879,11 +879,11 @@ int run_inline_cache_demo() {
                 ++hits;
             }
         })) {
-        std::cerr << "inline cache demo: add callback failed\n";
+        std::cerr << "instruction callback demo: add callback failed\n";
         return 1;
     }
     if (!framework.enable_instruction_callbacks()) {
-        std::cerr << "inline cache demo: enable callbacks failed\n";
+        std::cerr << "instruction callback demo: enable callbacks failed\n";
         return 1;
     }
 
@@ -894,7 +894,7 @@ int run_inline_cache_demo() {
 
     framework.disable_instruction_callbacks();
 
-    std::cout << "inline cache demo: total=" << total << " hits=" << hits << "\n";
+    std::cout << "instruction callback demo: total=" << total << " hits=" << hits << "\n";
     std::cout << "demo_target entry=0x" << std::hex << demo_entry << " start=0x" << demo_start << std::dec << "\n";
     return hits == 64 ? 0 : 1;
 }
@@ -1039,8 +1039,8 @@ int wmain(int argc, wchar_t* argv[]) {
     if (arg_is(cmd, {L"--self-patch-demo", L"--self-demo"})) {
         return run_self_patch_demo();
     }
-    if (arg_is(cmd, {L"--inline-cache-demo"})) {
-        return run_inline_cache_demo();
+    if (arg_is(cmd, {L"--instruction-callback-demo", L"--inline-cache-demo"})) {
+        return run_instruction_callback_demo();
     }
     if (cmd != nullptr) {
         return run_external_executable(argc - index, argv + index, plugins);
@@ -1057,7 +1057,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"       DBI.exe --patch-bytes <pid> <address> <hexbytes>\n";
     std::wcout << L"       DBI.exe --patch-nop <pid> <address> <count>\n";
     std::wcout << L"       DBI.exe --self-patch-demo\n";
-    std::wcout << L"       DBI.exe --inline-cache-demo\n";
+    std::wcout << L"       DBI.exe --instruction-callback-demo\n";
     std::wcout << L"       DBI.exe -l                                       (# --list-plugins)\n";
     std::wcout << L"       DBI.exe -c <command> [args...]                  (# --cmd)\n";
     std::wcout << L"global options:\n";

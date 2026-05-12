@@ -57,7 +57,7 @@ Basic forms:
 
 ```powershell
 DBI.exe <target.exe> [args...]
-DBI.exe --inline-cache-demo
+DBI.exe --instruction-callback-demo
 DBI.exe -l
 DBI.exe -p framework_showcase -c showcase.help
 DBI.exe -p framework_showcase -c showcase.ping
@@ -88,14 +88,14 @@ Primary public C++ surfaces live under `DBI/`:
 
 - `dbi_framework.*`: high-level framework wrapper.
 - `dynamic_binary_instrumentor.*`: in-process instrumentation coordinator.
-- `dispatcher_code_cache_instrumentor.h`: inline-patch translated code-cache backend.
+- `dispatcher_code_cache_instrumentor.h`: non-mutating hardware-breakpoint redirect backend. Registered addresses execute through generated cache blocks while the original bytes stay readable and intact.
 - `external_process_instrumentor.*`: debugger-driven external process instrumentation.
 - `live_patch_framework.*`: host-side patch helper exposed to plugins.
 - `plugin_api.h`: stable C ABI for plugins.
 - `plugin_manager.*`: plugin loading and event dispatch.
 - `dbi_host.*`: host wrapper around plugin manager and default plugin discovery.
 
-The current in-process instruction callback engine patches registered entry addresses with a jump into a generated code-cache block. The generated block preserves CPU state, calls registered callbacks, runs relocated original bytes, then jumps back to the original continuation.
+The default in-process instruction callback engine uses hardware execute breakpoints as entry traps, catches matching execution with a VEH, and redirects matching instruction pointers to a generated code-cache block. The cache block preserves CPU state, calls registered callbacks, executes relocated original bytes, then jumps back to the original continuation. It does not rewrite or hide the target instruction bytes.
 
 ## Sample Plugin
 
@@ -116,8 +116,8 @@ Commands:
 
 - Public alpha, not a stable API promise.
 - Windows x64 is the real target. x86 project configurations may exist but are not the alpha support target.
-- The translated code-cache backend handles entry-site instrumentation, not full process-wide basic-block translation.
-- Callback `CONTEXT` is informational; callback edits to RIP/EIP are not applied yet.
+- The default hardware-breakpoint code-cache backend instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
+- Callback `CONTEXT` includes x64 integer registers and flags. Edits to general-purpose registers and flags are applied before relocated bytes resume; edits to `RIP`/`RSP` are not applied yet.
 - Some injection/agent paths are experimental and should be treated as lab tooling.
 - Build/test coverage is manual right now; CI is not wired yet.
 

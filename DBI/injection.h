@@ -5,8 +5,7 @@
 #include <cctype>
 #include <vector>
 
-#include <phnt_windows.h>
-#include <phnt.h>
+#include <Windows.h>
 
 namespace injection {
 	bool inject_dll_via_manual_map(DWORD pid, const std::wstring& dll_path);

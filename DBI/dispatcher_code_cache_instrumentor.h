@@ -3,6 +3,7 @@
 #include "dynamic_binary_instrumentor.h"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <Zydis/Zydis.h>
 
@@ -22,11 +23,11 @@
 #undef min
 #undef max
 
-// In-process code-cache backend using an inline entry patch instead of debug
-// registers. The original entry bytes are copied into an executable cache block;
-// the entry site is patched with a rel32 JMP into that block. The generated block
-// preserves CPU state, calls callbacks, runs the relocated copied bytes, then
-// jumps back to the original continuation.
+// In-process code-cache backend using hardware execute breakpoints as
+// non-mutating entry traps. The original entry bytes are copied into an
+// executable cache block. A VEH catches execution at registered instruction
+// pointers, redirects RIP/EIP to the cache copy, and leaves the original bytes
+// readable and untouched.
 class dispatcher_code_cache_instrumentor {
 public:
     using callback_type = std::function<void(const instrumented_instruction&, CONTEXT&)>;
@@ -52,6 +53,11 @@ public:
         }
         if (sites_.find(address) != sites_.end()) {
             return true;
+        }
+        if (sites_.size() >= k_max_breakpoint_sites) {
+            trace_failure(address, "hardware_breakpoint_site_limit");
+            last_error_ = "hardware breakpoint site limit reached";
+            return false;
         }
 
         cached_site site{};
@@ -93,13 +99,34 @@ public:
             return false;
         }
 
+        veh_handle_ = AddVectoredExceptionHandler(1, &dispatcher_code_cache_instrumentor::vectored_handler);
+        if (veh_handle_ == nullptr) {
+            record_install_failure(
+                "add_vectored_exception_handler",
+                0,
+                0,
+                0,
+                0,
+                static_cast<unsigned long>(sites_.size()),
+                static_cast<unsigned long>(callbacks_.size()),
+                GetLastError());
+            return false;
+        }
+
         active_instance_ = this;
-        for (auto& [address, site] : sites_) {
-            if (!patch_entry(address, site)) {
-                restore_patches_locked();
-                active_instance_ = nullptr;
-                return false;
-            }
+        if (!apply_breakpoints_to_process_threads_locked(true)) {
+            apply_breakpoints_to_process_threads_locked(false);
+            active_instance_ = nullptr;
+            RemoveVectoredExceptionHandler(veh_handle_);
+            veh_handle_ = nullptr;
+            return false;
+        }
+        if (!start_thread_sync_worker_locked()) {
+            apply_breakpoints_to_process_threads_locked(false);
+            active_instance_ = nullptr;
+            RemoveVectoredExceptionHandler(veh_handle_);
+            veh_handle_ = nullptr;
+            return false;
         }
 
         installed_ = true;
@@ -107,9 +134,10 @@ public:
     }
 
     void uninstall() {
-        std::lock_guard<std::mutex> guard(lock_);
+        std::unique_lock<std::mutex> guard(lock_);
 
-        restore_patches_locked();
+        stop_thread_sync_worker_locked(guard);
+        apply_breakpoints_to_process_threads_locked(false);
 
         for (auto& [address, site] : sites_) {
             (void)address;
@@ -124,6 +152,10 @@ public:
         installed_ = false;
         if (active_instance_ == this) {
             active_instance_ = nullptr;
+        }
+        if (veh_handle_ != nullptr) {
+            RemoveVectoredExceptionHandler(veh_handle_);
+            veh_handle_ = nullptr;
         }
     }
 
@@ -145,13 +177,67 @@ private:
         std::vector<std::uint8_t> original_bytes{};
         std::uintptr_t cache_entry{0};
         std::size_t copied_size{0};
-        DWORD original_protect{0};
-        bool patched{false};
     };
 
-    static constexpr std::size_t k_inline_jump_size = 5;
+    static constexpr std::size_t k_max_breakpoint_sites = 4;
+    static constexpr DWORD64 k_dr7_breakpoint_slot_mask =
+        (1ULL << 0) |
+        (1ULL << 2) |
+        (1ULL << 4) |
+        (1ULL << 6) |
+        (0xFULL << 16) |
+        (0xFULL << 20) |
+        (0xFULL << 24) |
+        (0xFULL << 28);
 
-    static void dispatch_site_hit(std::uintptr_t address) {
+    static LONG CALLBACK vectored_handler(PEXCEPTION_POINTERS exception_info) {
+        dispatcher_code_cache_instrumentor* self = active_instance_;
+        if (self == nullptr || exception_info == nullptr || exception_info->ExceptionRecord == nullptr || exception_info->ContextRecord == nullptr) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        CONTEXT& context = *exception_info->ContextRecord;
+        const DWORD code = exception_info->ExceptionRecord->ExceptionCode;
+        if (code != EXCEPTION_SINGLE_STEP) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        const std::uintptr_t ip = instruction_pointer(context);
+        std::uintptr_t cache_entry = 0;
+        {
+            std::lock_guard<std::mutex> guard(self->lock_);
+            const auto it = self->sites_.find(ip);
+            if (it != self->sites_.end()) {
+                cache_entry = it->second.cache_entry;
+            }
+        }
+
+        if (cache_entry != 0) {
+            context.Dr6 = 0;
+            set_instruction_pointer(context, cache_entry);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static std::uintptr_t instruction_pointer(const CONTEXT& context) {
+#if defined(_M_X64)
+        return static_cast<std::uintptr_t>(context.Rip);
+#else
+        return static_cast<std::uintptr_t>(context.Eip);
+#endif
+    }
+
+    static void set_instruction_pointer(CONTEXT& context, std::uintptr_t address) {
+#if defined(_M_X64)
+        context.Rip = static_cast<DWORD64>(address);
+#else
+        context.Eip = static_cast<DWORD>(address);
+#endif
+    }
+
+    static void dispatch_site_hit(std::uintptr_t address, const void* saved_registers) {
         dispatcher_code_cache_instrumentor* self = active_instance_;
         if (self == nullptr) {
             return;
@@ -166,6 +252,7 @@ private:
         context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
 #if defined(_M_X64)
         context.Rip = static_cast<DWORD64>(address);
+        populate_context_from_saved_registers(saved_registers, context);
 #else
         context.Eip = static_cast<DWORD>(address);
 #endif
@@ -173,7 +260,88 @@ private:
         for (auto& cb : self->callbacks_) {
             cb(site->head_instruction, context);
         }
+
+#if defined(_M_X64)
+        apply_context_to_saved_registers(context, saved_registers);
+#endif
     }
+
+#if defined(_M_X64)
+    static constexpr std::size_t k_saved_r15_offset = 0x00;
+    static constexpr std::size_t k_saved_r14_offset = 0x08;
+    static constexpr std::size_t k_saved_r13_offset = 0x10;
+    static constexpr std::size_t k_saved_r12_offset = 0x18;
+    static constexpr std::size_t k_saved_r11_offset = 0x20;
+    static constexpr std::size_t k_saved_r10_offset = 0x28;
+    static constexpr std::size_t k_saved_r9_offset = 0x30;
+    static constexpr std::size_t k_saved_r8_offset = 0x38;
+    static constexpr std::size_t k_saved_rdi_offset = 0x40;
+    static constexpr std::size_t k_saved_rsi_offset = 0x48;
+    static constexpr std::size_t k_saved_rbp_offset = 0x50;
+    static constexpr std::size_t k_saved_rbx_offset = 0x58;
+    static constexpr std::size_t k_saved_rdx_offset = 0x60;
+    static constexpr std::size_t k_saved_rcx_offset = 0x68;
+    static constexpr std::size_t k_saved_rax_offset = 0x70;
+    static constexpr std::size_t k_saved_rflags_offset = 0x78;
+    static constexpr std::size_t k_saved_stack_size = 0x80;
+
+    static DWORD64 read_saved_u64(const void* saved_registers, std::size_t offset) {
+        if (saved_registers == nullptr) {
+            return 0;
+        }
+        const auto* base = static_cast<const std::uint8_t*>(saved_registers);
+        DWORD64 value = 0;
+        std::memcpy(&value, base + offset, sizeof(value));
+        return value;
+    }
+
+    static void write_saved_u64(const void* saved_registers, std::size_t offset, DWORD64 value) {
+        if (saved_registers == nullptr) {
+            return;
+        }
+        auto* base = const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(saved_registers));
+        std::memcpy(base + offset, &value, sizeof(value));
+    }
+
+    static void populate_context_from_saved_registers(const void* saved_registers, CONTEXT& context) {
+        context.Rax = read_saved_u64(saved_registers, k_saved_rax_offset);
+        context.Rcx = read_saved_u64(saved_registers, k_saved_rcx_offset);
+        context.Rdx = read_saved_u64(saved_registers, k_saved_rdx_offset);
+        context.Rbx = read_saved_u64(saved_registers, k_saved_rbx_offset);
+        context.Rbp = read_saved_u64(saved_registers, k_saved_rbp_offset);
+        context.Rsi = read_saved_u64(saved_registers, k_saved_rsi_offset);
+        context.Rdi = read_saved_u64(saved_registers, k_saved_rdi_offset);
+        context.R8 = read_saved_u64(saved_registers, k_saved_r8_offset);
+        context.R9 = read_saved_u64(saved_registers, k_saved_r9_offset);
+        context.R10 = read_saved_u64(saved_registers, k_saved_r10_offset);
+        context.R11 = read_saved_u64(saved_registers, k_saved_r11_offset);
+        context.R12 = read_saved_u64(saved_registers, k_saved_r12_offset);
+        context.R13 = read_saved_u64(saved_registers, k_saved_r13_offset);
+        context.R14 = read_saved_u64(saved_registers, k_saved_r14_offset);
+        context.R15 = read_saved_u64(saved_registers, k_saved_r15_offset);
+        context.Rsp = reinterpret_cast<DWORD64>(saved_registers) + k_saved_stack_size;
+        context.EFlags = static_cast<DWORD>(read_saved_u64(saved_registers, k_saved_rflags_offset) & 0xFFFFFFFFULL);
+    }
+
+    static void apply_context_to_saved_registers(const CONTEXT& context, const void* saved_registers) {
+        write_saved_u64(saved_registers, k_saved_rax_offset, context.Rax);
+        write_saved_u64(saved_registers, k_saved_rcx_offset, context.Rcx);
+        write_saved_u64(saved_registers, k_saved_rdx_offset, context.Rdx);
+        write_saved_u64(saved_registers, k_saved_rbx_offset, context.Rbx);
+        write_saved_u64(saved_registers, k_saved_rbp_offset, context.Rbp);
+        write_saved_u64(saved_registers, k_saved_rsi_offset, context.Rsi);
+        write_saved_u64(saved_registers, k_saved_rdi_offset, context.Rdi);
+        write_saved_u64(saved_registers, k_saved_r8_offset, context.R8);
+        write_saved_u64(saved_registers, k_saved_r9_offset, context.R9);
+        write_saved_u64(saved_registers, k_saved_r10_offset, context.R10);
+        write_saved_u64(saved_registers, k_saved_r11_offset, context.R11);
+        write_saved_u64(saved_registers, k_saved_r12_offset, context.R12);
+        write_saved_u64(saved_registers, k_saved_r13_offset, context.R13);
+        write_saved_u64(saved_registers, k_saved_r14_offset, context.R14);
+        write_saved_u64(saved_registers, k_saved_r15_offset, context.R15);
+        write_saved_u64(saved_registers, k_saved_rflags_offset, context.EFlags);
+    }
+#endif
 
     const cached_site* find_site(std::uintptr_t address) const {
         const auto it = sites_.find(address);
@@ -231,8 +399,8 @@ private:
         out_bytes.clear();
         out_size = 0;
 
-        constexpr std::size_t k_max_instructions = 16;
-        constexpr std::size_t k_max_bytes = 96;
+        constexpr std::size_t k_max_instructions = 1;
+        constexpr std::size_t k_max_bytes = 32;
 
         std::uintptr_t cursor = address;
         std::size_t total = 0;
@@ -247,9 +415,10 @@ private:
                 out_head = decoded;
             }
 
-            // This first dispatcher backend patches a prologue-sized prefix and
-            // returns to the original stream. Avoid swallowing a control-flow
-            // terminator into the entry patch span.
+            // Guard-page redirection enters the cache at the requested
+            // instruction, runs that relocated instruction, then jumps back to
+            // the original continuation. Keep control-flow instructions out
+            // until branch relocation is implemented deliberately.
             if (decoded.is_control_flow) {
                 return false;
             }
@@ -263,13 +432,7 @@ private:
 
             total += decoded.length;
             cursor += decoded.length;
-            if (total >= k_inline_jump_size) {
-                break;
-            }
-        }
-
-        if (total < k_inline_jump_size) {
-            return false;
+            break;
         }
 
         out_bytes.assign(total, 0);
@@ -378,85 +541,6 @@ private:
         return true;
     }
 
-    bool patch_entry(std::uintptr_t address, cached_site& site) {
-        std::vector<std::uint8_t> patch{};
-        if (!build_relative_jump_patch(address, site.cache_entry, site.copied_size, patch)) {
-            record_install_failure(
-                "rel32_patch_unreachable",
-                address,
-                site.cache_entry,
-                0,
-                0,
-                static_cast<unsigned long>(site.copied_size),
-                0,
-                0);
-            return false;
-        }
-
-        DWORD old_protect = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(address), site.copied_size, PAGE_EXECUTE_READWRITE, &old_protect)) {
-            record_install_failure(
-                "virtualprotect_entry",
-                address,
-                site.cache_entry,
-                0,
-                0,
-                static_cast<unsigned long>(site.copied_size),
-                0,
-                GetLastError());
-            return false;
-        }
-
-        std::memcpy(reinterpret_cast<void*>(address), patch.data(), patch.size());
-        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), patch.size());
-
-        DWORD ignored = 0;
-        VirtualProtect(reinterpret_cast<void*>(address), site.copied_size, old_protect, &ignored);
-
-        site.original_protect = old_protect;
-        site.patched = true;
-        return true;
-    }
-
-    void restore_patches_locked() {
-        for (auto& [address, site] : sites_) {
-            if (!site.patched || site.original_bytes.empty()) {
-                continue;
-            }
-
-            DWORD old_protect = 0;
-            if (VirtualProtect(reinterpret_cast<void*>(address), site.original_bytes.size(), PAGE_EXECUTE_READWRITE, &old_protect)) {
-                std::memcpy(reinterpret_cast<void*>(address), site.original_bytes.data(), site.original_bytes.size());
-                FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(address), site.original_bytes.size());
-                DWORD ignored = 0;
-                VirtualProtect(reinterpret_cast<void*>(address), site.original_bytes.size(), site.original_protect != 0 ? site.original_protect : old_protect, &ignored);
-            }
-            site.patched = false;
-        }
-    }
-
-    static bool build_relative_jump_patch(
-        std::uintptr_t source,
-        std::uintptr_t target,
-        std::size_t patch_span,
-        std::vector<std::uint8_t>& out_patch) {
-
-        if (patch_span < k_inline_jump_size) {
-            return false;
-        }
-
-        const std::int64_t disp = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(source + k_inline_jump_size);
-        if (disp < std::numeric_limits<std::int32_t>::min() || disp > std::numeric_limits<std::int32_t>::max()) {
-            return false;
-        }
-
-        out_patch.assign(patch_span, 0x90);
-        out_patch[0] = 0xE9;
-        const auto disp32 = static_cast<std::int32_t>(disp);
-        std::memcpy(out_patch.data() + 1, &disp32, sizeof(disp32));
-        return true;
-    }
-
     static void build_callback_prologue(std::uintptr_t site_address, std::vector<std::uint8_t>& out) {
         out.clear();
 #if defined(_M_X64)
@@ -485,6 +569,8 @@ private:
         }
 
         append_mov_rcx_imm64(site_address, out);
+        // mov rdx, r11 ; pass pointer to saved GPR/RFLAGS frame
+        out.insert(out.end(), {0x4C, 0x89, 0xDA});
         append_mov_rax_imm64(reinterpret_cast<std::uintptr_t>(&dispatcher_code_cache_instrumentor::dispatch_site_hit), out);
         out.insert(out.end(), {0xFF, 0xD0}); // call rax
 
@@ -775,6 +861,216 @@ private:
         }
     }
 
+    static std::vector<DWORD> collect_current_process_threads() {
+        std::vector<DWORD> tids{};
+        const DWORD pid = GetCurrentProcessId();
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return tids;
+        }
+
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        if (Thread32First(snapshot, &entry)) {
+            do {
+                if (entry.th32OwnerProcessID == pid) {
+                    tids.push_back(entry.th32ThreadID);
+                }
+            } while (Thread32Next(snapshot, &entry));
+        }
+
+        CloseHandle(snapshot);
+        return tids;
+    }
+
+    bool apply_breakpoints_to_process_threads_locked(bool enable) {
+        const std::vector<DWORD> tids = collect_current_process_threads();
+        if (tids.empty()) {
+            record_install_failure("no_process_threads", 0, 0, 0, 0, 0, 0, GetLastError());
+            return false;
+        }
+
+        bool current_thread_ok = false;
+        const DWORD current_tid = GetCurrentThreadId();
+        for (DWORD tid : tids) {
+            const bool ok = apply_breakpoints_to_thread(tid, enable);
+            if (tid == current_tid) {
+                current_thread_ok = ok;
+            }
+        }
+
+        if (enable && !current_thread_ok) {
+            record_install_failure("apply_current_thread_breakpoints", 0, 0, 0, 0, static_cast<unsigned long>(sites_.size()), 0, GetLastError());
+            return false;
+        }
+        return true;
+    }
+
+    bool start_thread_sync_worker_locked() {
+        if (sync_thread_ != nullptr) {
+            return true;
+        }
+
+        sync_stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (sync_stop_event_ == nullptr) {
+            record_install_failure("create_sync_stop_event", 0, 0, 0, 0, 0, 0, GetLastError());
+            return false;
+        }
+
+        sync_thread_ = CreateThread(nullptr, 0, &dispatcher_code_cache_instrumentor::thread_sync_proc, this, 0, nullptr);
+        if (sync_thread_ == nullptr) {
+            const DWORD gle = GetLastError();
+            CloseHandle(sync_stop_event_);
+            sync_stop_event_ = nullptr;
+            record_install_failure("create_thread_sync_worker", 0, 0, 0, 0, 0, 0, gle);
+            return false;
+        }
+        return true;
+    }
+
+    void stop_thread_sync_worker_locked(std::unique_lock<std::mutex>& guard) {
+        HANDLE thread = sync_thread_;
+        HANDLE stop_event = sync_stop_event_;
+        sync_thread_ = nullptr;
+        sync_stop_event_ = nullptr;
+
+        if (stop_event != nullptr) {
+            SetEvent(stop_event);
+        }
+
+        guard.unlock();
+        if (thread != nullptr) {
+            WaitForSingleObject(thread, 2000);
+            CloseHandle(thread);
+        }
+        if (stop_event != nullptr) {
+            CloseHandle(stop_event);
+        }
+        guard.lock();
+    }
+
+    static DWORD WINAPI thread_sync_proc(LPVOID parameter) {
+        auto* self = static_cast<dispatcher_code_cache_instrumentor*>(parameter);
+        if (self == nullptr) {
+            return 0;
+        }
+
+        for (;;) {
+            HANDLE stop_event = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(self->lock_);
+                stop_event = self->sync_stop_event_;
+                if (stop_event == nullptr || active_instance_ != self) {
+                    return 0;
+                }
+                self->apply_breakpoints_to_process_threads_locked(true);
+            }
+
+            if (WaitForSingleObject(stop_event, 25) == WAIT_OBJECT_0) {
+                return 0;
+            }
+        }
+    }
+
+    bool apply_breakpoints_to_thread(DWORD tid, bool enable) const {
+        if (tid == 0) {
+            return false;
+        }
+
+        const DWORD current_tid = GetCurrentThreadId();
+        HANDLE thread = nullptr;
+        if (tid == current_tid) {
+            thread = GetCurrentThread();
+        } else {
+            thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION, FALSE, tid);
+            if (thread == nullptr) {
+                return false;
+            }
+            SuspendThread(thread);
+        }
+
+        CONTEXT context{};
+        context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        const bool got_context = GetThreadContext(thread, &context) != FALSE;
+        bool ok = false;
+        if (got_context) {
+            if (enable) {
+                ok = write_breakpoints(context);
+            } else {
+                clear_breakpoints(context);
+                ok = true;
+            }
+            if (ok) {
+                ok = SetThreadContext(thread, &context) != FALSE;
+            }
+        }
+
+        if (tid != current_tid) {
+            ResumeThread(thread);
+            CloseHandle(thread);
+        }
+        return ok;
+    }
+
+    bool write_breakpoints(CONTEXT& context) const {
+        context.Dr0 = 0;
+        context.Dr1 = 0;
+        context.Dr2 = 0;
+        context.Dr3 = 0;
+        context.Dr6 = 0;
+        context.Dr7 &= ~k_dr7_breakpoint_slot_mask;
+
+        std::size_t slot = 0;
+        for (const auto& [address, site] : sites_) {
+            (void)site;
+            switch (slot) {
+            case 0:
+                context.Dr0 = address;
+                context.Dr7 |= (1ULL << 0);
+                break;
+            case 1:
+                context.Dr1 = address;
+                context.Dr7 |= (1ULL << 2);
+                break;
+            case 2:
+                context.Dr2 = address;
+                context.Dr7 |= (1ULL << 4);
+                break;
+            case 3:
+                context.Dr3 = address;
+                context.Dr7 |= (1ULL << 6);
+                break;
+            default:
+                return false;
+            }
+            ++slot;
+        }
+        return true;
+    }
+
+    void clear_breakpoints(CONTEXT& context) const {
+        for (const auto& [address, site] : sites_) {
+            (void)site;
+            if (context.Dr0 == address) {
+                context.Dr0 = 0;
+                context.Dr7 &= ~((1ULL << 0) | (0xFULL << 16));
+            }
+            if (context.Dr1 == address) {
+                context.Dr1 = 0;
+                context.Dr7 &= ~((1ULL << 2) | (0xFULL << 20));
+            }
+            if (context.Dr2 == address) {
+                context.Dr2 = 0;
+                context.Dr7 &= ~((1ULL << 4) | (0xFULL << 24));
+            }
+            if (context.Dr3 == address) {
+                context.Dr3 = 0;
+                context.Dr7 &= ~((1ULL << 6) | (0xFULL << 28));
+            }
+        }
+        context.Dr6 = 0;
+    }
+
     static void trace_failure(std::uintptr_t address, const char* stage) {
         if (stage == nullptr) {
             return;
@@ -830,6 +1126,9 @@ private:
     std::unordered_map<std::uintptr_t, cached_site> sites_{};
     std::vector<callback_type> callbacks_{};
     std::string last_error_{};
+    void* veh_handle_{nullptr};
+    HANDLE sync_thread_{nullptr};
+    HANDLE sync_stop_event_{nullptr};
     bool installed_{false};
     mutable std::mutex lock_{};
 
