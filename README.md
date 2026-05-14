@@ -126,8 +126,4 @@ Commands:
 - Some injection/agent paths are experimental and should be treated as lab tooling.
 - Build/test coverage is manual right now; CI is not wired yet.
 
-## Security And Scope
-
-NDIF is dual-use instrumentation tooling. Use it only on software and systems you own or have explicit permission to analyze. The public alpha is meant for defensive research, debugging, and instrumentation experiments, not unauthorized tampering.
-
 See `SECURITY.md` for vulnerability reporting.
