@@ -59,6 +59,7 @@ Basic forms:
 DBI.exe <target.exe> [args...]
 DBI.exe --instruction-callback-demo
 DBI.exe --dispatcher-callback-demo
+DBI.exe --indirect-redirect-demo
 DBI.exe --translated-cache-demo
 DBI.exe -l
 DBI.exe -p framework_showcase -c showcase.help
@@ -98,7 +99,9 @@ Primary public C++ surfaces live under `DBI/`:
 - `plugin_manager.*`: plugin loading and event dispatch.
 - `dbi_host.*`: host wrapper around plugin manager and default plugin discovery.
 
-The default in-process instruction callback engine is now the translated basic-block cache. Callers register an entry with `instrument_instruction`, enable callbacks, then enter execution through `translated_function<T>()` / `translated_entry()`. This path does not use VEH because execution starts in cache-owned translated blocks instead of trapping from original code.
+The default in-process instruction callback engine is now the translated basic-block cache. Callers can explicitly enter through `translated_function<T>()` / `translated_entry()`. Address registrations made with `instrument_instruction()` are also used as native entry traps: a debug-register trap catches execution at that address and redirects RIP into the translated cache while leaving original instruction bytes untouched.
+
+For call sites that already use a mutable code-pointer boundary, callers can register a pointer slot with `redirect_indirect_call_target()` / `redirect_indirect_function<T>()`. When callbacks are enabled, NDIF translates the slot's current destination and replaces only the pointer slot with the cache entry; the caller's instruction bytes are left untouched. `restore_indirect_redirect()` or `disable_instruction_callbacks()` restores the original slot value.
 
 The legacy dispatcher backend remains available through `dbi_framework_options::instruction_backend = instruction_callback_backend::dispatcher_code_cache` and through `DBI.exe --dispatcher-callback-demo`. It uses hardware execute breakpoints as entry traps, catches matching execution with a VEH, and redirects matching instruction pointers to a generated code-cache block while leaving original bytes intact.
 
@@ -121,7 +124,8 @@ Commands:
 
 - Public alpha, not a stable API promise.
 - Windows x64 is the real target. x86 project configurations may exist but are not the alpha support target.
-- The default translated-cache backend only observes execution that enters through a translated entrypoint. It is not transparent attach-style instrumentation for arbitrary already-running original code.
+- The default translated-cache backend observes explicit translated entrypoints and up to four registered native entry-trap addresses. It is not full-process transparent DBT for arbitrary already-running original code.
+- Indirect pointer-slot redirects require an existing mutable function pointer, callback slot, vtable/IAT-like entry, or equivalent boundary. They do not redirect hardcoded direct calls by themselves.
 - The legacy hardware-breakpoint dispatcher instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
 - The translated basic-block cache is an early prototype. It supports ordinary instructions, returns, and direct conditional/unconditional branches, including simple backward branches; unsupported indirect control flow can still leave the cache.
 - Callback `CONTEXT` includes x64 integer registers and flags. Edits to general-purpose registers and flags are applied before relocated bytes resume; edits to `RIP`/`RSP` are not applied yet.

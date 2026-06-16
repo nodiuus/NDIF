@@ -894,18 +894,8 @@ int run_instruction_callback_demo(instruction_callback_backend backend = instruc
 
     int total = 0;
     const bool translated_backend = backend == instruction_callback_backend::translated_cache;
-    translated_demo_fn translated = nullptr;
-    if (translated_backend) {
-        translated = framework.translated_function<translated_demo_fn>(demo_start);
-        if (translated == nullptr) {
-            std::cerr << "instruction callback demo: translated entry failed: " << framework.last_instruction_error() << "\n";
-            framework.disable_instruction_callbacks();
-            return 1;
-        }
-    }
-
     for (int i = 0; i < 64; ++i) {
-        total += translated_backend ? translated(i) : demo_target(i);
+        total += demo_target(i);
     }
 
     framework.disable_instruction_callbacks();
@@ -914,6 +904,69 @@ int run_instruction_callback_demo(instruction_callback_backend backend = instruc
               << " total=" << total << " hits=" << hits << "\n";
     std::cout << "demo_target entry=0x" << std::hex << demo_entry << " start=0x" << demo_start << std::dec << "\n";
     return hits == 64 ? 0 : 1;
+}
+
+int run_indirect_redirect_demo() {
+    dbi_framework framework{};
+    dbi_framework_options options{};
+    options.enable_plugins = false;
+    options.instruction_backend = instruction_callback_backend::translated_cache;
+    if (!framework.initialize(options)) {
+        std::cerr << "indirect redirect demo: framework init failed\n";
+        return 1;
+    }
+
+    translated_demo_fn slot = &demo_target;
+    const auto original_slot_value = reinterpret_cast<std::uintptr_t>(slot);
+    std::size_t hits = 0;
+
+    if (!framework.add_instruction_callback([&](CONTEXT&, std::uintptr_t) {
+            ++hits;
+        })) {
+        std::cerr << "indirect redirect demo: add callback failed\n";
+        return 1;
+    }
+
+    std::uint64_t redirect_id = 0;
+    if (!framework.redirect_indirect_function(&slot, &redirect_id)) {
+        std::cerr << "indirect redirect demo: redirect registration failed\n";
+        return 1;
+    }
+
+    if (!framework.enable_instruction_callbacks()) {
+        std::cerr << "indirect redirect demo: enable callbacks failed\n";
+        std::cerr << "indirect redirect demo: backend error: " << framework.last_instruction_error() << "\n";
+        return 1;
+    }
+
+    const auto redirected_slot_value = reinterpret_cast<std::uintptr_t>(slot);
+    int total = 0;
+    for (int i = 0; i < 64; ++i) {
+        total += slot(i);
+    }
+
+    if (!framework.restore_indirect_redirect(redirect_id)) {
+        std::cerr << "indirect redirect demo: restore failed\n";
+        framework.disable_instruction_callbacks();
+        return 1;
+    }
+
+    const auto restored_slot_value = reinterpret_cast<std::uintptr_t>(slot);
+    const int native_check = slot(10);
+    framework.disable_instruction_callbacks();
+
+    std::cout << "indirect redirect demo: total=" << total << " hits=" << hits << "\n";
+    std::cout << "slot original=0x" << std::hex << original_slot_value
+              << " redirected=0x" << redirected_slot_value
+              << " restored=0x" << restored_slot_value << std::dec << "\n";
+
+    return hits != 0 &&
+           redirected_slot_value != 0 &&
+           redirected_slot_value != original_slot_value &&
+           restored_slot_value == original_slot_value &&
+           native_check == demo_target(10)
+        ? 0
+        : 1;
 }
 
 int run_translated_cache_demo() {
@@ -1166,6 +1219,9 @@ int wmain(int argc, wchar_t* argv[]) {
     if (arg_is(cmd, {L"--dispatcher-callback-demo"})) {
         return run_instruction_callback_demo(instruction_callback_backend::dispatcher_code_cache);
     }
+    if (arg_is(cmd, {L"--indirect-redirect-demo"})) {
+        return run_indirect_redirect_demo();
+    }
     if (arg_is(cmd, {L"--translated-cache-demo", L"--bb-cache-demo"})) {
         return run_translated_cache_demo();
     }
@@ -1186,6 +1242,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"       DBI.exe --self-patch-demo\n";
     std::wcout << L"       DBI.exe --instruction-callback-demo          (# translated-cache backend)\n";
     std::wcout << L"       DBI.exe --dispatcher-callback-demo           (# legacy dispatcher backend)\n";
+    std::wcout << L"       DBI.exe --indirect-redirect-demo\n";
     std::wcout << L"       DBI.exe --translated-cache-demo\n";
     std::wcout << L"       DBI.exe -l                                       (# --list-plugins)\n";
     std::wcout << L"       DBI.exe -c <command> [args...]                  (# --cmd)\n";

@@ -98,23 +98,46 @@ public:
     const char* last_instruction_error() const;
     void disable_instruction_callbacks();
     void* translated_entry(std::uintptr_t address);
+    bool redirect_indirect_call_target(void** target_slot, std::uint64_t* out_redirect_id = nullptr);
+    bool restore_indirect_redirect(std::uint64_t redirect_id);
 
     template <typename Fn>
     Fn translated_function(std::uintptr_t address) {
         return reinterpret_cast<Fn>(translated_entry(address));
     }
 
+    template <typename Fn>
+    bool redirect_indirect_function(Fn* target_slot, std::uint64_t* out_redirect_id = nullptr) {
+        return redirect_indirect_call_target(reinterpret_cast<void**>(target_slot), out_redirect_id);
+    }
+
 private:
+    struct indirect_redirect_record {
+        std::uint64_t id{0};
+        void** target_slot{nullptr};
+        std::uintptr_t original_target{0};
+        std::uintptr_t translated_target{0};
+        std::uint64_t patch_id{0};
+        bool installed{false};
+    };
+
     bool ensure_patcher_ready();
+    bool read_pointer_slot(void** target_slot, std::uintptr_t& value) const;
+    bool install_indirect_redirect(indirect_redirect_record& redirect);
+    void restore_installed_indirect_redirects();
     void forward_instruction_hit(DWORD pid, const instrumented_instruction& inst, CONTEXT& ctx);
 
     dbi_host host_{};
     instruction_callback_backend instruction_backend_{instruction_callback_backend::translated_cache};
     dynamic_binary_instrumentor self_instrumentor_{};
     dispatcher_code_cache_instrumentor dispatcher_code_cache_callbacks_{};
+    dispatcher_code_cache_instrumentor translated_cache_entry_traps_{};
     basic_block_code_cache translated_cache_callbacks_{};
     std::vector<std::uintptr_t> translated_requested_entries_{};
+    std::vector<indirect_redirect_record> indirect_redirects_{};
     std::vector<std::function<void(CONTEXT&, std::uintptr_t)>> instruction_callbacks_user_{};
     external_process_instrumentor external_instrumentor_{};
     live_patch_framework patcher_{};
+    std::uint64_t next_indirect_redirect_id_{1};
+    bool instruction_callbacks_enabled_{false};
 };

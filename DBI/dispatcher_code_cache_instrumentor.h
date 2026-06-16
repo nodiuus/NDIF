@@ -31,6 +31,7 @@
 class dispatcher_code_cache_instrumentor {
 public:
     using callback_type = std::function<void(const instrumented_instruction&, CONTEXT&)>;
+    using entry_redirect_resolver_type = std::function<std::uintptr_t(std::uintptr_t)>;
 
     dispatcher_code_cache_instrumentor() = default;
     ~dispatcher_code_cache_instrumentor() {
@@ -81,6 +82,20 @@ public:
         }
 
         callbacks_.push_back(std::move(callback));
+        return true;
+    }
+
+    bool set_entry_redirect_resolver(entry_redirect_resolver_type resolver) {
+        if (!resolver) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> guard(lock_);
+        if (installed_) {
+            return false;
+        }
+
+        entry_redirect_resolver_ = std::move(resolver);
         return true;
     }
 
@@ -148,6 +163,7 @@ public:
         }
 
         callbacks_.clear();
+        entry_redirect_resolver_ = nullptr;
         sites_.clear();
         installed_ = false;
         if (active_instance_ == this) {
@@ -209,6 +225,12 @@ private:
             const auto it = self->sites_.find(ip);
             if (it != self->sites_.end()) {
                 cache_entry = it->second.cache_entry;
+                if (self->entry_redirect_resolver_) {
+                    const std::uintptr_t redirected = self->entry_redirect_resolver_(ip);
+                    if (redirected != 0) {
+                        cache_entry = redirected;
+                    }
+                }
             }
         }
 
@@ -1121,6 +1143,7 @@ private:
 
     std::unordered_map<std::uintptr_t, cached_site> sites_{};
     std::vector<callback_type> callbacks_{};
+    entry_redirect_resolver_type entry_redirect_resolver_{};
     std::string last_error_{};
     void* veh_handle_{nullptr};
     HANDLE sync_thread_{nullptr};

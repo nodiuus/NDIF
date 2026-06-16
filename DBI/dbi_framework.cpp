@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 
+#include <cstring>
 #include <vector>
 
 #include <Zydis/Zydis.h>
@@ -88,6 +89,71 @@ bool dbi_framework::write_nops(std::uintptr_t address, std::size_t count, std::u
 
 bool dbi_framework::remove_patch(std::uint64_t patch_id) {
     return patcher_.remove_patch(patch_id);
+}
+
+bool dbi_framework::read_pointer_slot(void** target_slot, std::uintptr_t& value) const {
+    value = 0;
+    if (target_slot == nullptr) {
+        return false;
+    }
+
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(target_slot, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0 || (mbi.Protect & PAGE_NOACCESS) != 0) {
+        return false;
+    }
+
+    void* current = nullptr;
+    std::memcpy(&current, target_slot, sizeof(current));
+    value = reinterpret_cast<std::uintptr_t>(current);
+    return value != 0;
+}
+
+bool dbi_framework::install_indirect_redirect(indirect_redirect_record& redirect) {
+    if (redirect.installed) {
+        return true;
+    }
+    if (instruction_backend_ != instruction_callback_backend::translated_cache ||
+        redirect.target_slot == nullptr ||
+        redirect.original_target == 0) {
+        return false;
+    }
+
+    void* translated = translated_cache_callbacks_.translate_entry(redirect.original_target);
+    if (translated == nullptr) {
+        return false;
+    }
+
+    if (!ensure_patcher_ready()) {
+        return false;
+    }
+
+    std::uintptr_t translated_value = reinterpret_cast<std::uintptr_t>(translated);
+    std::vector<std::uint8_t> bytes(sizeof(translated_value));
+    std::memcpy(bytes.data(), &translated_value, sizeof(translated_value));
+
+    std::uint64_t patch_id = 0;
+    if (!patcher_.write_patch(reinterpret_cast<std::uintptr_t>(redirect.target_slot), bytes, patch_id)) {
+        return false;
+    }
+
+    redirect.translated_target = translated_value;
+    redirect.patch_id = patch_id;
+    redirect.installed = true;
+    return true;
+}
+
+void dbi_framework::restore_installed_indirect_redirects() {
+    for (auto it = indirect_redirects_.rbegin(); it != indirect_redirects_.rend(); ++it) {
+        if (it->installed) {
+            patcher_.remove_patch(it->patch_id);
+            it->installed = false;
+            it->patch_id = 0;
+            it->translated_target = 0;
+        }
+    }
 }
 
 bool dbi_framework::instrument_self(
@@ -225,7 +291,7 @@ bool dbi_framework::enable_instruction_callbacks() {
     };
 
     if (instruction_backend_ == instruction_callback_backend::translated_cache) {
-        if (translated_requested_entries_.empty()) {
+        if (translated_requested_entries_.empty() && indirect_redirects_.empty()) {
             plugins().on_process_exit(pid, 1);
             return false;
         }
@@ -237,12 +303,48 @@ bool dbi_framework::enable_instruction_callbacks() {
 
         for (const std::uintptr_t entry : translated_requested_entries_) {
             if (translated_cache_callbacks_.translate_entry(entry) == nullptr) {
+                translated_cache_entry_traps_.uninstall();
+                restore_installed_indirect_redirects();
                 translated_cache_callbacks_.reset();
                 plugins().on_process_exit(pid, 1);
                 return false;
             }
         }
 
+        if (!translated_requested_entries_.empty()) {
+            for (const std::uintptr_t entry : translated_requested_entries_) {
+                if (!translated_cache_entry_traps_.instrument_instruction(entry)) {
+                    restore_installed_indirect_redirects();
+                    translated_cache_callbacks_.reset();
+                    plugins().on_process_exit(pid, 1);
+                    return false;
+                }
+            }
+
+            if (!translated_cache_entry_traps_.set_entry_redirect_resolver([this](std::uintptr_t address) -> std::uintptr_t {
+                    return reinterpret_cast<std::uintptr_t>(translated_cache_callbacks_.translate_entry(address));
+                }) ||
+                !translated_cache_entry_traps_.add_callback([](const instrumented_instruction&, CONTEXT&) {}) ||
+                !translated_cache_entry_traps_.install()) {
+                translated_cache_entry_traps_.uninstall();
+                restore_installed_indirect_redirects();
+                translated_cache_callbacks_.reset();
+                plugins().on_process_exit(pid, 1);
+                return false;
+            }
+        }
+
+        for (auto& redirect : indirect_redirects_) {
+            if (!install_indirect_redirect(redirect)) {
+                translated_cache_entry_traps_.uninstall();
+                restore_installed_indirect_redirects();
+                translated_cache_callbacks_.reset();
+                plugins().on_process_exit(pid, 1);
+                return false;
+            }
+        }
+
+        instruction_callbacks_enabled_ = true;
         return true;
     }
 
@@ -256,6 +358,7 @@ bool dbi_framework::enable_instruction_callbacks() {
         return false;
     }
 
+    instruction_callbacks_enabled_ = true;
     return true;
 }
 
@@ -268,12 +371,16 @@ const char* dbi_framework::last_instruction_error() const {
 
 void dbi_framework::disable_instruction_callbacks() {
     if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+        translated_cache_entry_traps_.uninstall();
+        restore_installed_indirect_redirects();
         translated_cache_callbacks_.reset();
         translated_requested_entries_.clear();
+        indirect_redirects_.clear();
     } else {
         dispatcher_code_cache_callbacks_.uninstall();
     }
     instruction_callbacks_user_.clear();
+    instruction_callbacks_enabled_ = false;
     plugins().on_process_exit(GetCurrentProcessId(), 0);
 }
 
@@ -282,6 +389,59 @@ void* dbi_framework::translated_entry(std::uintptr_t address) {
         return nullptr;
     }
     return translated_cache_callbacks_.translate_entry(address);
+}
+
+bool dbi_framework::redirect_indirect_call_target(void** target_slot, std::uint64_t* out_redirect_id) {
+    if (instruction_backend_ != instruction_callback_backend::translated_cache) {
+        return false;
+    }
+
+    for (const auto& redirect : indirect_redirects_) {
+        if (redirect.target_slot == target_slot) {
+            if (out_redirect_id != nullptr) {
+                *out_redirect_id = redirect.id;
+            }
+            return true;
+        }
+    }
+
+    std::uintptr_t original_target = 0;
+    if (!read_pointer_slot(target_slot, original_target)) {
+        return false;
+    }
+
+    indirect_redirect_record redirect{};
+    redirect.id = next_indirect_redirect_id_++;
+    redirect.target_slot = target_slot;
+    redirect.original_target = original_target;
+
+    indirect_redirects_.push_back(redirect);
+    indirect_redirect_record& stored = indirect_redirects_.back();
+    if (instruction_callbacks_enabled_ && !install_indirect_redirect(stored)) {
+        indirect_redirects_.pop_back();
+        return false;
+    }
+
+    if (out_redirect_id != nullptr) {
+        *out_redirect_id = stored.id;
+    }
+    return true;
+}
+
+bool dbi_framework::restore_indirect_redirect(std::uint64_t redirect_id) {
+    for (auto it = indirect_redirects_.begin(); it != indirect_redirects_.end(); ++it) {
+        if (it->id != redirect_id) {
+            continue;
+        }
+
+        if (it->installed && !patcher_.remove_patch(it->patch_id)) {
+            return false;
+        }
+        indirect_redirects_.erase(it);
+        return true;
+    }
+
+    return false;
 }
 
 void dbi_framework::forward_instruction_hit(DWORD pid, const instrumented_instruction& inst, CONTEXT& ctx) {
