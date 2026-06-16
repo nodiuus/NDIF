@@ -33,6 +33,7 @@ __declspec(dllexport) int start() {
 
     dbi_framework_options opts{};
     opts.enable_plugins = false;
+    opts.instruction_backend = instruction_callback_backend::dispatcher_code_cache;
 
     ndif = new dbi_framework();
     ndif->initialize(opts);

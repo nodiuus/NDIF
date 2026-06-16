@@ -855,10 +855,11 @@ int run_self_patch_demo() {
     return 0;
 }
 
-int run_instruction_callback_demo() {
+int run_instruction_callback_demo(instruction_callback_backend backend = instruction_callback_backend::translated_cache) {
     dbi_framework framework{};
     dbi_framework_options options{};
     options.enable_plugins = false;
+    options.instruction_backend = backend;
     if (!framework.initialize(options)) {
         std::cerr << "instruction callback demo: framework init failed\n";
         return 1;
@@ -887,17 +888,30 @@ int run_instruction_callback_demo() {
     }
     if (!framework.enable_instruction_callbacks()) {
         std::cerr << "instruction callback demo: enable callbacks failed\n";
+        std::cerr << "instruction callback demo: backend error: " << framework.last_instruction_error() << "\n";
         return 1;
     }
 
     int total = 0;
+    const bool translated_backend = backend == instruction_callback_backend::translated_cache;
+    translated_demo_fn translated = nullptr;
+    if (translated_backend) {
+        translated = framework.translated_function<translated_demo_fn>(demo_start);
+        if (translated == nullptr) {
+            std::cerr << "instruction callback demo: translated entry failed: " << framework.last_instruction_error() << "\n";
+            framework.disable_instruction_callbacks();
+            return 1;
+        }
+    }
+
     for (int i = 0; i < 64; ++i) {
-        total += demo_target(i);
+        total += translated_backend ? translated(i) : demo_target(i);
     }
 
     framework.disable_instruction_callbacks();
 
-    std::cout << "instruction callback demo: total=" << total << " hits=" << hits << "\n";
+    std::cout << "instruction callback demo: backend=" << (translated_backend ? "translated_cache" : "dispatcher_code_cache")
+              << " total=" << total << " hits=" << hits << "\n";
     std::cout << "demo_target entry=0x" << std::hex << demo_entry << " start=0x" << demo_start << std::dec << "\n";
     return hits == 64 ? 0 : 1;
 }
@@ -923,6 +937,15 @@ int run_translated_cache_demo() {
         0x8D, 0x41, 0x02,       // lea eax, [rcx+2]
         0xC3                    // ret
     };
+    const std::uint8_t loop_code[] = {
+        0x31, 0xC0,             // xor eax, eax
+        0x85, 0xC9,             // test ecx, ecx
+        0x7E, 0x06,             // jle +6
+        0x01, 0xC8,             // add eax, ecx
+        0xFF, 0xC9,             // dec ecx
+        0x7F, 0xFA,             // jg -6
+        0xC3                    // ret
+    };
 
     void* demo_memory = VirtualAlloc(nullptr, sizeof(demo_code), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (demo_memory == nullptr) {
@@ -932,12 +955,32 @@ int run_translated_cache_demo() {
     std::memcpy(demo_memory, demo_code, sizeof(demo_code));
     FlushInstructionCache(GetCurrentProcess(), demo_memory, sizeof(demo_code));
 
+    void* loop_memory = VirtualAlloc(nullptr, sizeof(loop_code), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (loop_memory == nullptr) {
+        std::cerr << "translated cache demo: loop VirtualAlloc failed\n";
+        VirtualFree(demo_memory, 0, MEM_RELEASE);
+        return 1;
+    }
+    std::memcpy(loop_memory, loop_code, sizeof(loop_code));
+    FlushInstructionCache(GetCurrentProcess(), loop_memory, sizeof(loop_code));
+
     const auto demo_entry = reinterpret_cast<std::uintptr_t>(demo_memory);
     translated_demo_fn native = reinterpret_cast<translated_demo_fn>(demo_memory);
     translated_demo_fn translated = cache.translate_function<translated_demo_fn>(demo_entry);
     if (translated == nullptr) {
         std::cerr << "translated cache demo: translate failed: " << cache.last_error() << "\n";
         VirtualFree(demo_memory, 0, MEM_RELEASE);
+        VirtualFree(loop_memory, 0, MEM_RELEASE);
+        return 1;
+    }
+
+    const auto loop_entry = reinterpret_cast<std::uintptr_t>(loop_memory);
+    translated_demo_fn loop_native = reinterpret_cast<translated_demo_fn>(loop_memory);
+    translated_demo_fn loop_translated = cache.translate_function<translated_demo_fn>(loop_entry);
+    if (loop_translated == nullptr) {
+        std::cerr << "translated cache demo: loop translate failed: " << cache.last_error() << "\n";
+        VirtualFree(demo_memory, 0, MEM_RELEASE);
+        VirtualFree(loop_memory, 0, MEM_RELEASE);
         return 1;
     }
 
@@ -946,6 +989,13 @@ int run_translated_cache_demo() {
     for (int i = 0; i < 256; ++i) {
         native_total += native(i);
         translated_total += translated(i);
+    }
+
+    int loop_native_total = 0;
+    int loop_translated_total = 0;
+    for (int i = -5; i < 64; ++i) {
+        loop_native_total += loop_native(i);
+        loop_translated_total += loop_translated(i);
     }
 
     std::vector<std::pair<std::uintptr_t, std::size_t>> sorted_hits(hit_counts.begin(), hit_counts.end());
@@ -957,14 +1007,16 @@ int run_translated_cache_demo() {
         });
 
     std::cout << "translated cache demo: native_total=" << native_total << " translated_total=" << translated_total << "\n";
+    std::cout << "translated cache loop: native_total=" << loop_native_total << " translated_total=" << loop_translated_total << "\n";
     std::cout << "demo_target entry=0x" << std::hex << demo_entry << std::dec << "\n";
     std::cout << "translated instruction hits (top 8):\n";
     for (std::size_t i = 0; i < std::min<std::size_t>(sorted_hits.size(), 8); ++i) {
         std::cout << "  0x" << std::hex << sorted_hits[i].first << std::dec << " -> " << sorted_hits[i].second << "\n";
     }
 
-    const bool ok = native_total == translated_total && !hit_counts.empty();
+    const bool ok = native_total == translated_total && loop_native_total == loop_translated_total && !hit_counts.empty();
     VirtualFree(demo_memory, 0, MEM_RELEASE);
+    VirtualFree(loop_memory, 0, MEM_RELEASE);
     return ok ? 0 : 1;
 }
 
@@ -1111,6 +1163,9 @@ int wmain(int argc, wchar_t* argv[]) {
     if (arg_is(cmd, {L"--instruction-callback-demo", L"--inline-cache-demo"})) {
         return run_instruction_callback_demo();
     }
+    if (arg_is(cmd, {L"--dispatcher-callback-demo"})) {
+        return run_instruction_callback_demo(instruction_callback_backend::dispatcher_code_cache);
+    }
     if (arg_is(cmd, {L"--translated-cache-demo", L"--bb-cache-demo"})) {
         return run_translated_cache_demo();
     }
@@ -1129,7 +1184,8 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"       DBI.exe --patch-bytes <pid> <address> <hexbytes>\n";
     std::wcout << L"       DBI.exe --patch-nop <pid> <address> <count>\n";
     std::wcout << L"       DBI.exe --self-patch-demo\n";
-    std::wcout << L"       DBI.exe --instruction-callback-demo\n";
+    std::wcout << L"       DBI.exe --instruction-callback-demo          (# translated-cache backend)\n";
+    std::wcout << L"       DBI.exe --dispatcher-callback-demo           (# legacy dispatcher backend)\n";
     std::wcout << L"       DBI.exe --translated-cache-demo\n";
     std::wcout << L"       DBI.exe -l                                       (# --list-plugins)\n";
     std::wcout << L"       DBI.exe -c <command> [args...]                  (# --cmd)\n";

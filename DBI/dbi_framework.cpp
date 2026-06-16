@@ -7,6 +7,7 @@
 #include <Zydis/Zydis.h>
 
 bool dbi_framework::initialize(const dbi_framework_options& options) {
+    instruction_backend_ = options.instruction_backend;
     if (options.enable_plugins) {
         host_.load_plugins(options.plugins_dir, options.explicit_plugins);
         if (!host_.plugins().configure_loaded_plugins(options.plugin_arguments)) {
@@ -182,6 +183,17 @@ int dbi_framework::instrument_instruction_with_status(std::uintptr_t address) {
     if (address == 0) {
         return instrumentation_status::invalid_address;
     }
+
+    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+        for (const std::uintptr_t existing : translated_requested_entries_) {
+            if (existing == address) {
+                return instrumentation_status::already_instrumented;
+            }
+        }
+        translated_requested_entries_.push_back(address);
+        return instrumentation_status::success;
+    }
+
     return dispatcher_code_cache_callbacks_.instrument_instruction(address) ? instrumentation_status::success : instrumentation_status::backend_failure;
 }
 
@@ -209,15 +221,30 @@ bool dbi_framework::enable_instruction_callbacks() {
     plugins().on_process_start(pid, L"");
 
     auto bridge_callback = [this, pid](const instrumented_instruction& inst, CONTEXT& ctx) {
-        plugins().on_instruction_hit(pid, inst.address);
-        if (inst.is_control_flow) {
-            plugins().on_branch_hit(pid, inst.address, ZydisMnemonicGetString(inst.mnemonic), inst.length);
+        forward_instruction_hit(pid, inst, ctx);
+    };
+
+    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+        if (translated_requested_entries_.empty()) {
+            plugins().on_process_exit(pid, 1);
+            return false;
         }
 
-        for (auto& cb : instruction_callbacks_user_) {
-            cb(ctx, inst.address);
+        if (!translated_cache_callbacks_.add_callback(bridge_callback)) {
+            plugins().on_process_exit(pid, 1);
+            return false;
         }
-    };
+
+        for (const std::uintptr_t entry : translated_requested_entries_) {
+            if (translated_cache_callbacks_.translate_entry(entry) == nullptr) {
+                translated_cache_callbacks_.reset();
+                plugins().on_process_exit(pid, 1);
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     if (!dispatcher_code_cache_callbacks_.add_callback(bridge_callback)) {
         plugins().on_process_exit(pid, 1);
@@ -233,11 +260,37 @@ bool dbi_framework::enable_instruction_callbacks() {
 }
 
 const char* dbi_framework::last_instruction_error() const {
+    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+        return translated_cache_callbacks_.last_error();
+    }
     return dispatcher_code_cache_callbacks_.last_error();
 }
 
 void dbi_framework::disable_instruction_callbacks() {
-    dispatcher_code_cache_callbacks_.uninstall();
+    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+        translated_cache_callbacks_.reset();
+        translated_requested_entries_.clear();
+    } else {
+        dispatcher_code_cache_callbacks_.uninstall();
+    }
     instruction_callbacks_user_.clear();
     plugins().on_process_exit(GetCurrentProcessId(), 0);
+}
+
+void* dbi_framework::translated_entry(std::uintptr_t address) {
+    if (address == 0) {
+        return nullptr;
+    }
+    return translated_cache_callbacks_.translate_entry(address);
+}
+
+void dbi_framework::forward_instruction_hit(DWORD pid, const instrumented_instruction& inst, CONTEXT& ctx) {
+    plugins().on_instruction_hit(pid, inst.address);
+    if (inst.is_control_flow) {
+        plugins().on_branch_hit(pid, inst.address, ZydisMnemonicGetString(inst.mnemonic), inst.length);
+    }
+
+    for (auto& cb : instruction_callbacks_user_) {
+        cb(ctx, inst.address);
+    }
 }

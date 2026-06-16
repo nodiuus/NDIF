@@ -1,5 +1,6 @@
 #pragma once
 
+#include "basic_block_code_cache.h"
 #include "dbi_host.h"
 #include "dynamic_binary_instrumentor.h"
 #include "dispatcher_code_cache_instrumentor.h"
@@ -24,8 +25,14 @@ enum instrumentation_status {
     backend_failure = 0x5
 };
 
+enum class instruction_callback_backend {
+    translated_cache,
+    dispatcher_code_cache
+};
+
 struct dbi_framework_options {
     bool enable_plugins{true};
+    instruction_callback_backend instruction_backend{instruction_callback_backend::translated_cache};
     std::wstring plugins_dir{dbi_host::default_plugins_dir()};
     std::vector<std::wstring> explicit_plugins{};
     std::vector<std::string> plugin_arguments{};
@@ -81,22 +88,32 @@ public:
         DWORD timeout_ms,
         external_instrumentation_result& out_result);
 
-    // In-process instruction callbacks. Default backend redirects hardware
-    // execute-breakpoint hits into a generated code-cache copy without modifying
-    // or hiding target bytes.
+    // In-process instruction callbacks. The default backend is translated-cache
+    // execution: call translated_function<T>() and execute the returned entry.
+    // The dispatcher backend remains available through dbi_framework_options.
     int instrument_instruction_with_status(std::uintptr_t address);
     bool instrument_instruction(std::uintptr_t address);
     bool add_instruction_callback(std::function<void(CONTEXT& ctx, std::uintptr_t ip)> callback);
     bool enable_instruction_callbacks();
     const char* last_instruction_error() const;
     void disable_instruction_callbacks();
+    void* translated_entry(std::uintptr_t address);
+
+    template <typename Fn>
+    Fn translated_function(std::uintptr_t address) {
+        return reinterpret_cast<Fn>(translated_entry(address));
+    }
 
 private:
     bool ensure_patcher_ready();
+    void forward_instruction_hit(DWORD pid, const instrumented_instruction& inst, CONTEXT& ctx);
 
     dbi_host host_{};
+    instruction_callback_backend instruction_backend_{instruction_callback_backend::translated_cache};
     dynamic_binary_instrumentor self_instrumentor_{};
     dispatcher_code_cache_instrumentor dispatcher_code_cache_callbacks_{};
+    basic_block_code_cache translated_cache_callbacks_{};
+    std::vector<std::uintptr_t> translated_requested_entries_{};
     std::vector<std::function<void(CONTEXT&, std::uintptr_t)>> instruction_callbacks_user_{};
     external_process_instrumentor external_instrumentor_{};
     live_patch_framework patcher_{};

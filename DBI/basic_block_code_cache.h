@@ -168,12 +168,7 @@ private:
                 }
 
                 const std::uintptr_t fallthrough = entry.inst.address + entry.inst.length;
-                const std::uintptr_t taken_cache = translate_block_locked(target);
-                const std::uintptr_t fallthrough_cache = translate_block_locked(fallthrough);
-                if (taken_cache == 0 || fallthrough_cache == 0) {
-                    return 0;
-                }
-                emit_conditional_direct(condition, taken_cache, fallthrough_cache, code);
+                emit_conditional_dispatch(condition, target, fallthrough, code);
                 ended = true;
                 break;
             }
@@ -181,11 +176,7 @@ private:
             if (is_unconditional_branch(entry.decoded)) {
                 std::uintptr_t target = 0;
                 if (relative_target(entry, target)) {
-                    const std::uintptr_t target_cache = translate_block_locked(target);
-                    if (target_cache == 0) {
-                        return 0;
-                    }
-                    build_absolute_jump(target_cache, code);
+                    emit_dispatch_jump(target, code);
                 } else {
                     entry.cache_offset = code.size();
                     entry.copied_to_cache = true;
@@ -210,7 +201,12 @@ private:
             emit_dispatch_jump(cursor, code);
         }
 
-        void* cache = VirtualAlloc(nullptr, code.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (code.empty()) {
+            last_error_ = "empty translated block";
+            return 0;
+        }
+
+        void* cache = allocate_writable_near(address, code.size());
         if (cache == nullptr) {
             last_error_ = "VirtualAlloc failed";
             return 0;
@@ -220,6 +216,13 @@ private:
         const std::uintptr_t cache_base = reinterpret_cast<std::uintptr_t>(cache);
         auto* cache_bytes = static_cast<std::uint8_t*>(cache);
         if (!relocate_relative_fields(entries, cache_bytes, cache_base)) {
+            VirtualFree(cache, 0, MEM_RELEASE);
+            return 0;
+        }
+
+        DWORD old_protect = 0;
+        if (!VirtualProtect(cache, code.size(), PAGE_EXECUTE_READ, &old_protect)) {
+            last_error_ = "VirtualProtect executable failed";
             VirtualFree(cache, 0, MEM_RELEASE);
             return 0;
         }
@@ -527,6 +530,71 @@ private:
         build_absolute_jump(taken_cache, out);
     }
 
+    static void emit_conditional_dispatch(
+        std::uint8_t condition,
+        std::uintptr_t taken_target,
+        std::uintptr_t fallthrough_target,
+        std::vector<std::uint8_t>& out) {
+
+        const std::size_t jcc_pos = out.size();
+        out.push_back(0x0F);
+        out.push_back(static_cast<std::uint8_t>(0x80 | (condition & 0x0F)));
+        append_u32(0, out);
+
+        emit_dispatch_jump(fallthrough_target, out);
+
+        const std::size_t taken_label = out.size();
+        const std::int32_t disp = static_cast<std::int32_t>(taken_label - (jcc_pos + 6));
+        std::memcpy(out.data() + jcc_pos + 2, &disp, sizeof(disp));
+
+        emit_dispatch_jump(taken_target, out);
+    }
+
+    static void* allocate_writable_near(std::uintptr_t reference, std::size_t size) {
+        if (size == 0) {
+            return nullptr;
+        }
+
+#if defined(_M_X64)
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        const std::uintptr_t granularity = static_cast<std::uintptr_t>(si.dwAllocationGranularity);
+        if (granularity == 0) {
+            return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+
+        constexpr std::uintptr_t max_disp = static_cast<std::uintptr_t>(std::numeric_limits<std::int32_t>::max());
+        const std::uintptr_t min_addr = (reference > max_disp) ? (reference - max_disp) : 0;
+        const std::uintptr_t max_addr = (reference < (std::numeric_limits<std::uintptr_t>::max() - max_disp))
+                                            ? (reference + max_disp)
+                                            : std::numeric_limits<std::uintptr_t>::max();
+
+        auto align_down = [granularity](std::uintptr_t value) -> std::uintptr_t {
+            return value & ~(granularity - 1);
+        };
+
+        for (std::uintptr_t distance = 0; distance < max_disp; distance += granularity) {
+            const std::uintptr_t candidates[2] = {
+                (reference >= distance) ? align_down(reference - distance) : 0,
+                (reference <= (std::numeric_limits<std::uintptr_t>::max() - distance)) ? align_down(reference + distance) : 0
+            };
+
+            for (const std::uintptr_t candidate : candidates) {
+                if (candidate < min_addr || candidate > max_addr) {
+                    continue;
+                }
+
+                void* p = VirtualAlloc(reinterpret_cast<void*>(candidate), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (p != nullptr) {
+                    return p;
+                }
+            }
+        }
+#endif
+
+        return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+
     static void build_absolute_jump(std::uintptr_t target, std::vector<std::uint8_t>& out) {
 #if defined(_M_X64)
         out.insert(out.end(), {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00});
@@ -540,6 +608,7 @@ private:
 
     static void emit_dispatch_jump(std::uintptr_t target, std::vector<std::uint8_t>& out) {
 #if defined(_M_X64)
+        append_push_gpr64(3, out);
         append_push_gpr64(0, out);
         append_push_gpr64(1, out);
         append_push_gpr64(2, out);
@@ -547,13 +616,13 @@ private:
         append_push_gpr64(9, out);
         append_push_gpr64(10, out);
 
-        out.insert(out.end(), {0x49, 0x89, 0xE3}); // mov r11, rsp
+        out.insert(out.end(), {0x48, 0x89, 0xE3}); // mov rbx, rsp
         out.insert(out.end(), {0x48, 0x83, 0xE4, 0xF0}); // and rsp, -16
         out.insert(out.end(), {0x48, 0x83, 0xEC, 0x20}); // sub rsp, 0x20
         append_mov_rcx_imm64(target, out);
         append_mov_rax_imm64(reinterpret_cast<std::uintptr_t>(&basic_block_code_cache::resolve_block_entry), out);
         out.insert(out.end(), {0xFF, 0xD0}); // call rax
-        out.insert(out.end(), {0x4C, 0x89, 0xDC}); // mov rsp, r11
+        out.insert(out.end(), {0x48, 0x89, 0xDC}); // mov rsp, rbx
         out.insert(out.end(), {0x49, 0x89, 0xC3}); // mov r11, rax
 
         append_pop_gpr64(10, out);
@@ -562,6 +631,7 @@ private:
         append_pop_gpr64(2, out);
         append_pop_gpr64(1, out);
         append_pop_gpr64(0, out);
+        append_pop_gpr64(3, out);
         out.insert(out.end(), {0x41, 0xFF, 0xE3}); // jmp r11
 #else
         out.push_back(0x68);

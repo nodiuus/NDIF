@@ -58,6 +58,7 @@ Basic forms:
 ```powershell
 DBI.exe <target.exe> [args...]
 DBI.exe --instruction-callback-demo
+DBI.exe --dispatcher-callback-demo
 DBI.exe --translated-cache-demo
 DBI.exe -l
 DBI.exe -p framework_showcase -c showcase.help
@@ -97,9 +98,9 @@ Primary public C++ surfaces live under `DBI/`:
 - `plugin_manager.*`: plugin loading and event dispatch.
 - `dbi_host.*`: host wrapper around plugin manager and default plugin discovery.
 
-The default in-process instruction callback engine uses hardware execute breakpoints as entry traps, catches matching execution with a VEH, and redirects matching instruction pointers to a generated code-cache block. The cache block preserves CPU state, calls registered callbacks, executes relocated original bytes, then jumps back to the original continuation. It does not rewrite or hide the target instruction bytes.
+The default in-process instruction callback engine is now the translated basic-block cache. Callers register an entry with `instrument_instruction`, enable callbacks, then enter execution through `translated_function<T>()` / `translated_entry()`. This path does not use VEH because execution starts in cache-owned translated blocks instead of trapping from original code.
 
-The translated basic-block cache prototype is a separate #4-style path: callers enter a translated function entry directly, and direct branch targets are resolved into translated blocks on demand. It is the path intended to grow toward DynamoRIO/PIN-style cache-owned execution.
+The legacy dispatcher backend remains available through `dbi_framework_options::instruction_backend = instruction_callback_backend::dispatcher_code_cache` and through `DBI.exe --dispatcher-callback-demo`. It uses hardware execute breakpoints as entry traps, catches matching execution with a VEH, and redirects matching instruction pointers to a generated code-cache block while leaving original bytes intact.
 
 ## Sample Plugin
 
@@ -120,8 +121,9 @@ Commands:
 
 - Public alpha, not a stable API promise.
 - Windows x64 is the real target. x86 project configurations may exist but are not the alpha support target.
-- The default hardware-breakpoint code-cache backend instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
-- The translated basic-block cache is an early prototype. It supports ordinary instructions, returns, and direct conditional/unconditional branches; unsupported indirect control flow can still leave the cache.
+- The default translated-cache backend only observes execution that enters through a translated entrypoint. It is not transparent attach-style instrumentation for arbitrary already-running original code.
+- The legacy hardware-breakpoint dispatcher instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
+- The translated basic-block cache is an early prototype. It supports ordinary instructions, returns, and direct conditional/unconditional branches, including simple backward branches; unsupported indirect control flow can still leave the cache.
 - Callback `CONTEXT` includes x64 integer registers and flags. Edits to general-purpose registers and flags are applied before relocated bytes resume; edits to `RIP`/`RSP` are not applied yet.
 - Some injection/agent paths are experimental and should be treated as lab tooling.
 - Build/test coverage is manual right now; CI is not wired yet.
