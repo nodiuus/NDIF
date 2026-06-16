@@ -31,8 +31,11 @@ enum class instruction_callback_backend {
 };
 
 struct dbi_framework_options {
+    using log_callback_type = std::function<void(const char*)>;
+
     bool enable_plugins{true};
     instruction_callback_backend instruction_backend{instruction_callback_backend::translated_cache};
+    log_callback_type log_callback{};
     std::wstring plugins_dir{dbi_host::default_plugins_dir()};
     std::vector<std::wstring> explicit_plugins{};
     std::vector<std::string> plugin_arguments{};
@@ -48,6 +51,7 @@ public:
     dbi_framework& operator=(const dbi_framework&) = delete;
 
     bool initialize(const dbi_framework_options& options = {});
+    void set_log_callback(dbi_framework_options::log_callback_type callback);
 
     plugin_manager& plugins();
     const plugin_manager& plugins() const;
@@ -89,8 +93,9 @@ public:
         external_instrumentation_result& out_result);
 
     // In-process instruction callbacks. The default backend is translated-cache
-    // execution: call translated_function<T>() and execute the returned entry.
-    // The dispatcher backend remains available through dbi_framework_options.
+    // execution: enter through translated_function<T>(), pointer-slot redirect,
+    // or DBT-style thread context handoff. The dispatcher backend remains
+    // available through dbi_framework_options when a VEH entry trap is desired.
     int instrument_instruction_with_status(std::uintptr_t address);
     bool instrument_instruction(std::uintptr_t address);
     bool add_instruction_callback(std::function<void(CONTEXT& ctx, std::uintptr_t ip)> callback);
@@ -98,6 +103,8 @@ public:
     const char* last_instruction_error() const;
     void disable_instruction_callbacks();
     void* translated_entry(std::uintptr_t address);
+    bool translate_context(CONTEXT& context);
+    bool handoff_thread(HANDLE thread, bool suspend_thread = true);
     bool redirect_indirect_call_target(void** target_slot, std::uint64_t* out_redirect_id = nullptr);
     bool restore_indirect_redirect(std::uint64_t redirect_id);
 
@@ -131,7 +138,6 @@ private:
     instruction_callback_backend instruction_backend_{instruction_callback_backend::translated_cache};
     dynamic_binary_instrumentor self_instrumentor_{};
     dispatcher_code_cache_instrumentor dispatcher_code_cache_callbacks_{};
-    dispatcher_code_cache_instrumentor translated_cache_entry_traps_{};
     basic_block_code_cache translated_cache_callbacks_{};
     std::vector<std::uintptr_t> translated_requested_entries_{};
     std::vector<indirect_redirect_record> indirect_redirects_{};
@@ -140,4 +146,5 @@ private:
     live_patch_framework patcher_{};
     std::uint64_t next_indirect_redirect_id_{1};
     bool instruction_callbacks_enabled_{false};
+    dbi_framework_options::log_callback_type log_callback_{};
 };

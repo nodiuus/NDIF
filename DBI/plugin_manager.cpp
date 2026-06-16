@@ -162,14 +162,12 @@ void safe_free_library(HMODULE module) {
 } // namespace
 
 void plugin_manager::host_log(void* host_context, const char* message) {
-    (void)host_context;
-    if (message == nullptr) {
+    if (host_context == nullptr || message == nullptr) {
         return;
     }
 
-    std::cerr << "[plugin] " << message << "\n";
-    OutputDebugStringA(message);
-    OutputDebugStringA("\n");
+    auto* self = reinterpret_cast<plugin_manager*>(host_context);
+    self->emit_log(message);
 }
 
 int plugin_manager::host_apply_patch_bytes(void* host_context, uint32_t pid, uint64_t address, const uint8_t* bytes, size_t size, uint64_t* out_patch_id) {
@@ -206,6 +204,32 @@ dbi_host_api plugin_manager::build_host_api() {
     host.reserved1 = nullptr;
     host.reserved2 = nullptr;
     return host;
+}
+
+void plugin_manager::set_log_callback(std::function<void(const char*)> callback) {
+    std::lock_guard<std::mutex> guard(lock_);
+    log_callback_ = std::move(callback);
+}
+
+void plugin_manager::emit_log(const char* message) const {
+    if (message == nullptr) {
+        return;
+    }
+
+    std::function<void(const char*)> callback{};
+    {
+        std::lock_guard<std::mutex> guard(lock_);
+        callback = log_callback_;
+    }
+
+    if (callback) {
+        callback(message);
+        return;
+    }
+
+    std::cerr << "[plugin] " << message << "\n";
+    OutputDebugStringA(message);
+    OutputDebugStringA("\n");
 }
 
 bool plugin_manager::load_from_directory(const std::wstring& directory) {

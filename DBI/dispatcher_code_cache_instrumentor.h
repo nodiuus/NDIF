@@ -32,6 +32,7 @@ class dispatcher_code_cache_instrumentor {
 public:
     using callback_type = std::function<void(const instrumented_instruction&, CONTEXT&)>;
     using entry_redirect_resolver_type = std::function<std::uintptr_t(std::uintptr_t)>;
+    using log_callback_type = std::function<void(const char*)>;
 
     dispatcher_code_cache_instrumentor() = default;
     ~dispatcher_code_cache_instrumentor() {
@@ -97,6 +98,11 @@ public:
 
         entry_redirect_resolver_ = std::move(resolver);
         return true;
+    }
+
+    void set_log_callback(log_callback_type callback) {
+        std::lock_guard<std::mutex> guard(lock_);
+        log_callback_ = std::move(callback);
     }
 
     bool install() {
@@ -1089,7 +1095,7 @@ private:
         context.Dr6 = 0;
     }
 
-    static void trace_failure(std::uintptr_t address, const char* stage) {
+    void trace_failure(std::uintptr_t address, const char* stage) {
         if (stage == nullptr) {
             return;
         }
@@ -1102,9 +1108,7 @@ private:
             "[dispatcher_code_cache] instrument_instruction failed stage=%s address=0x%llx\n",
             stage,
             static_cast<unsigned long long>(address));
-        OutputDebugStringA(message);
-        std::fputs(message, stdout);
-        std::fflush(stdout);
+        emit_log(message);
     }
 
     void record_install_failure(
@@ -1136,6 +1140,19 @@ private:
             value_b,
             static_cast<unsigned long>(gle));
         last_error_ = message;
+        emit_log(message);
+    }
+
+    void emit_log(const char* message) const {
+        if (message == nullptr) {
+            return;
+        }
+
+        if (log_callback_) {
+            log_callback_(message);
+            return;
+        }
+
         OutputDebugStringA(message);
         std::fputs(message, stdout);
         std::fflush(stdout);
@@ -1144,6 +1161,7 @@ private:
     std::unordered_map<std::uintptr_t, cached_site> sites_{};
     std::vector<callback_type> callbacks_{};
     entry_redirect_resolver_type entry_redirect_resolver_{};
+    log_callback_type log_callback_{};
     std::string last_error_{};
     void* veh_handle_{nullptr};
     HANDLE sync_thread_{nullptr};

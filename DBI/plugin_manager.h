@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,7 @@ public:
 
     bool dispatch_command(const std::string& command, const std::vector<std::string>& args, int& out_exit_code);
     bool configure_loaded_plugins(const std::vector<std::string>& args);
+    void set_log_callback(std::function<void(const char*)> callback);
 
     // Host patch service exposed to plugins via dbi_host_api.
     bool apply_patch_bytes(std::uint32_t pid, std::uint64_t address, const std::uint8_t* bytes, std::size_t size, std::uint64_t& out_patch_id);
@@ -65,10 +67,12 @@ private:
 
     dbi_host_api build_host_api();
     void close_plugin(plugin_entry& plugin);
+    void emit_log(const char* message) const;
 
     mutable std::mutex lock_{};
     std::vector<plugin_entry> plugins_{};
     dbi_host_api host_api_{}; // stable storage for plugins to keep a pointer to
+    std::function<void(const char*)> log_callback_{};
 
     // Host-managed patch ids so plugins can remove patches later.
     std::uint64_t next_host_patch_id_{1};

@@ -894,8 +894,18 @@ int run_instruction_callback_demo(instruction_callback_backend backend = instruc
 
     int total = 0;
     const bool translated_backend = backend == instruction_callback_backend::translated_cache;
+    translated_demo_fn translated = nullptr;
+    if (translated_backend) {
+        translated = framework.translated_function<translated_demo_fn>(demo_start);
+        if (translated == nullptr) {
+            std::cerr << "instruction callback demo: translated entry failed: " << framework.last_instruction_error() << "\n";
+            framework.disable_instruction_callbacks();
+            return 1;
+        }
+    }
+
     for (int i = 0; i < 64; ++i) {
-        total += demo_target(i);
+        total += translated_backend ? translated(i) : demo_target(i);
     }
 
     framework.disable_instruction_callbacks();

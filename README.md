@@ -99,7 +99,7 @@ Primary public C++ surfaces live under `DBI/`:
 - `plugin_manager.*`: plugin loading and event dispatch.
 - `dbi_host.*`: host wrapper around plugin manager and default plugin discovery.
 
-The default in-process instruction callback engine is now the translated basic-block cache. Callers can explicitly enter through `translated_function<T>()` / `translated_entry()`. Address registrations made with `instrument_instruction()` are also used as native entry traps: a debug-register trap catches execution at that address and redirects RIP into the translated cache while leaving original instruction bytes untouched.
+The default in-process instruction callback engine is now the translated basic-block cache. Callers can explicitly enter through `translated_function<T>()` / `translated_entry()`, redirect an existing mutable code-pointer slot, or perform a DBT-style thread handoff with `translate_context()` / `handoff_thread()`. The translated-cache backend does not patch call-site bytes and does not install a VEH entry trap.
 
 For call sites that already use a mutable code-pointer boundary, callers can register a pointer slot with `redirect_indirect_call_target()` / `redirect_indirect_function<T>()`. When callbacks are enabled, NDIF translates the slot's current destination and replaces only the pointer slot with the cache entry; the caller's instruction bytes are left untouched. `restore_indirect_redirect()` or `disable_instruction_callbacks()` restores the original slot value.
 
@@ -124,7 +124,7 @@ Commands:
 
 - Public alpha, not a stable API promise.
 - Windows x64 is the real target. x86 project configurations may exist but are not the alpha support target.
-- The default translated-cache backend observes explicit translated entrypoints and up to four registered native entry-trap addresses. It is not full-process transparent DBT for arbitrary already-running original code.
+- The default translated-cache backend observes explicit translated entrypoints, redirected pointer slots, and threads handed off by context rewrite. It is not full-process transparent DBT for arbitrary already-running original code.
 - Indirect pointer-slot redirects require an existing mutable function pointer, callback slot, vtable/IAT-like entry, or equivalent boundary. They do not redirect hardcoded direct calls by themselves.
 - The legacy hardware-breakpoint dispatcher instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
 - The translated basic-block cache is an early prototype. It supports ordinary instructions, returns, and direct conditional/unconditional branches, including simple backward branches; unsupported indirect control flow can still leave the cache.
