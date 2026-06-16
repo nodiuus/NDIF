@@ -186,19 +186,6 @@ private:
                 break;
             }
 
-            if (is_call(entry.decoded)) {
-                std::uintptr_t target = 0;
-                if (!relative_target(entry, target)) {
-                    last_error_ = "unsupported indirect call";
-                    return 0;
-                }
-
-                const std::uintptr_t fallthrough = entry.inst.address + entry.inst.length;
-                emit_dispatch_call(target, fallthrough, code);
-                ended = true;
-                break;
-            }
-
             entry.cache_offset = code.size();
             entry.copied_to_cache = true;
             code.insert(code.end(), entry.bytes.begin(), entry.bytes.end());
@@ -372,10 +359,6 @@ private:
 
     static bool is_unconditional_branch(const ZydisDecodedInstruction& decoded) {
         return decoded.meta.category == ZYDIS_CATEGORY_UNCOND_BR;
-    }
-
-    static bool is_call(const ZydisDecodedInstruction& decoded) {
-        return decoded.meta.category == ZYDIS_CATEGORY_CALL;
     }
 
     static bool is_return(const ZydisDecodedInstruction& decoded) {
@@ -654,42 +637,6 @@ private:
         out.push_back(0x68);
         append_u32(static_cast<std::uint32_t>(target), out);
         out.push_back(0xC3);
-#endif
-    }
-
-    static void emit_dispatch_call(std::uintptr_t target, std::uintptr_t fallthrough, std::vector<std::uint8_t>& out) {
-#if defined(_M_X64)
-        append_push_gpr64(3, out);
-        append_push_gpr64(0, out);
-        append_push_gpr64(1, out);
-        append_push_gpr64(2, out);
-        append_push_gpr64(8, out);
-        append_push_gpr64(9, out);
-        append_push_gpr64(10, out);
-
-        out.insert(out.end(), {0x48, 0x89, 0xE3}); // mov rbx, rsp
-        out.insert(out.end(), {0x48, 0x83, 0xE4, 0xF0}); // and rsp, -16
-        out.insert(out.end(), {0x48, 0x83, 0xEC, 0x20}); // sub rsp, 0x20
-        append_mov_rcx_imm64(fallthrough, out);
-        append_mov_rax_imm64(reinterpret_cast<std::uintptr_t>(&basic_block_code_cache::resolve_block_entry), out);
-        out.insert(out.end(), {0xFF, 0xD0}); // call rax
-        out.insert(out.end(), {0x48, 0x89, 0xDC}); // mov rsp, rbx
-        out.insert(out.end(), {0x49, 0x89, 0xC3}); // mov r11, rax
-
-        append_pop_gpr64(10, out);
-        append_pop_gpr64(9, out);
-        append_pop_gpr64(8, out);
-        append_pop_gpr64(2, out);
-        append_pop_gpr64(1, out);
-        append_pop_gpr64(0, out);
-        append_pop_gpr64(3, out);
-
-        out.insert(out.end(), {0x41, 0x53}); // push r11
-        emit_dispatch_jump(target, out);
-#else
-        out.push_back(0x68);
-        append_u32(static_cast<std::uint32_t>(fallthrough), out);
-        emit_dispatch_jump(target, out);
 #endif
     }
 

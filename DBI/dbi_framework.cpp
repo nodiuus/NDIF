@@ -24,6 +24,7 @@ void dbi_framework::set_log_callback(dbi_framework_options::log_callback_type ca
     log_callback_ = std::move(callback);
     host_.plugins().set_log_callback(log_callback_);
     dispatcher_code_cache_callbacks_.set_log_callback(log_callback_);
+    translated_cache_entry_traps_.set_log_callback(log_callback_);
 }
 
 plugin_manager& dbi_framework::plugins() {
@@ -306,6 +307,30 @@ bool dbi_framework::enable_instruction_callbacks() {
 
         for (const std::uintptr_t entry : translated_requested_entries_) {
             if (translated_cache_callbacks_.translate_entry(entry) == nullptr) {
+                translated_cache_entry_traps_.uninstall();
+                restore_installed_indirect_redirects();
+                translated_cache_callbacks_.reset();
+                plugins().on_process_exit(pid, 1);
+                return false;
+            }
+        }
+
+        if (!translated_requested_entries_.empty()) {
+            for (const std::uintptr_t entry : translated_requested_entries_) {
+                if (!translated_cache_entry_traps_.instrument_instruction(entry)) {
+                    restore_installed_indirect_redirects();
+                    translated_cache_callbacks_.reset();
+                    plugins().on_process_exit(pid, 1);
+                    return false;
+                }
+            }
+
+            if (!translated_cache_entry_traps_.set_entry_redirect_resolver([this](std::uintptr_t address) -> std::uintptr_t {
+                    return reinterpret_cast<std::uintptr_t>(translated_cache_callbacks_.translate_entry(address));
+                }) ||
+                !translated_cache_entry_traps_.add_callback([](const instrumented_instruction&, CONTEXT&) {}) ||
+                !translated_cache_entry_traps_.install()) {
+                translated_cache_entry_traps_.uninstall();
                 restore_installed_indirect_redirects();
                 translated_cache_callbacks_.reset();
                 plugins().on_process_exit(pid, 1);
@@ -315,6 +340,7 @@ bool dbi_framework::enable_instruction_callbacks() {
 
         for (auto& redirect : indirect_redirects_) {
             if (!install_indirect_redirect(redirect)) {
+                translated_cache_entry_traps_.uninstall();
                 restore_installed_indirect_redirects();
                 translated_cache_callbacks_.reset();
                 plugins().on_process_exit(pid, 1);
@@ -349,6 +375,7 @@ const char* dbi_framework::last_instruction_error() const {
 
 void dbi_framework::disable_instruction_callbacks() {
     if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+        translated_cache_entry_traps_.uninstall();
         restore_installed_indirect_redirects();
         translated_cache_callbacks_.reset();
         translated_requested_entries_.clear();
@@ -366,73 +393,6 @@ void* dbi_framework::translated_entry(std::uintptr_t address) {
         return nullptr;
     }
     return translated_cache_callbacks_.translate_entry(address);
-}
-
-bool dbi_framework::translate_context(CONTEXT& context) {
-    if (instruction_backend_ != instruction_callback_backend::translated_cache) {
-        return false;
-    }
-
-#if defined(_M_X64)
-    const std::uintptr_t ip = static_cast<std::uintptr_t>(context.Rip);
-    if (ip == 0) {
-        return false;
-    }
-
-    void* translated = translated_cache_callbacks_.translate_entry(ip);
-    if (translated == nullptr) {
-        return false;
-    }
-
-    context.Rip = reinterpret_cast<DWORD64>(translated);
-    context.ContextFlags |= CONTEXT_CONTROL;
-    return true;
-#else
-    const std::uintptr_t ip = static_cast<std::uintptr_t>(context.Eip);
-    if (ip == 0) {
-        return false;
-    }
-
-    void* translated = translated_cache_callbacks_.translate_entry(ip);
-    if (translated == nullptr) {
-        return false;
-    }
-
-    context.Eip = reinterpret_cast<DWORD>(translated);
-    context.ContextFlags |= CONTEXT_CONTROL;
-    return true;
-#endif
-}
-
-bool dbi_framework::handoff_thread(HANDLE thread, bool suspend_thread) {
-    if (thread == nullptr || thread == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    const DWORD target_tid = GetThreadId(thread);
-    if (target_tid == 0 || target_tid == GetCurrentThreadId()) {
-        return false;
-    }
-
-    bool suspended = false;
-    if (suspend_thread) {
-        if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
-            return false;
-        }
-        suspended = true;
-    }
-
-    CONTEXT context{};
-    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-    bool ok = GetThreadContext(thread, &context) != FALSE;
-    if (ok) {
-        ok = translate_context(context) && SetThreadContext(thread, &context) != FALSE;
-    }
-
-    if (suspended) {
-        ResumeThread(thread);
-    }
-    return ok;
 }
 
 bool dbi_framework::redirect_indirect_call_target(void** target_slot, std::uint64_t* out_redirect_id) {
