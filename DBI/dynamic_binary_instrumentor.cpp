@@ -123,7 +123,12 @@ bool dynamic_binary_instrumentor::decode_region(const address_range& range) {
     while (offset < range.size) {
         ZydisDecodedInstruction decoded{};
         const void* cursor = base + offset;
-        const std::size_t remaining = range.size - offset;
+        // A caller may request a one-byte entry trap, but x86 instructions
+        // can be longer than one byte. Decode from a full instruction window
+        // while keeping the instrumentation range boundary unchanged.
+        const std::size_t remaining = (range.size - offset) < 15
+            ? 15
+            : range.size - offset;
 
         ZyanStatus status{};
 #if defined(ZYDIS_VERSION) && (ZYDIS_VERSION_MAJOR(ZYDIS_VERSION) >= 4)

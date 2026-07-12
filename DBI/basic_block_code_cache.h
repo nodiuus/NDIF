@@ -124,15 +124,14 @@ private:
         populate_context_from_saved_registers(saved_registers, context);
 #else
         context.Eip = static_cast<DWORD>(address);
+        populate_context_from_saved_registers(saved_registers, context);
 #endif
 
         for (auto& callback : self->callbacks_) {
             callback(instruction, context);
         }
 
-#if defined(_M_X64)
         apply_context_to_saved_registers(context, saved_registers);
-#endif
     }
 
     std::uintptr_t translate_block_locked(std::uintptr_t address) {
@@ -688,7 +687,18 @@ private:
         append_pop_gpr64(0, out);
         out.push_back(0x9D);
 #else
-        (void)site_address;
+        out.push_back(0x9C);
+        out.push_back(0x60);
+        out.insert(out.end(), {0x89, 0xE0});
+        out.push_back(0x50);
+        out.push_back(0x68);
+        append_u32(static_cast<std::uint32_t>(site_address), out);
+        out.push_back(0xB8);
+        append_u32(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&basic_block_code_cache::dispatch_instruction_hit)), out);
+        out.insert(out.end(), {0xFF, 0xD0});
+        out.insert(out.end(), {0x83, 0xC4, 0x08});
+        out.push_back(0x61);
+        out.push_back(0x9D);
 #endif
     }
 
@@ -824,6 +834,57 @@ private:
         for (std::size_t i = 0; i < sizeof(value); ++i) {
             out.push_back(static_cast<std::uint8_t>((value >> (i * 8)) & 0xFF));
         }
+    }
+#else
+    static constexpr std::size_t k_saved_edi_offset = 0x00;
+    static constexpr std::size_t k_saved_esi_offset = 0x04;
+    static constexpr std::size_t k_saved_ebp_offset = 0x08;
+    static constexpr std::size_t k_saved_ebx_offset = 0x10;
+    static constexpr std::size_t k_saved_edx_offset = 0x14;
+    static constexpr std::size_t k_saved_ecx_offset = 0x18;
+    static constexpr std::size_t k_saved_eax_offset = 0x1C;
+    static constexpr std::size_t k_saved_eflags_offset = 0x20;
+    static constexpr std::size_t k_saved_stack_size = 0x24;
+
+    static DWORD read_saved_u32(const void* saved_registers, std::size_t offset) {
+        if (saved_registers == nullptr) {
+            return 0;
+        }
+        const auto* base = static_cast<const std::uint8_t*>(saved_registers);
+        DWORD value = 0;
+        std::memcpy(&value, base + offset, sizeof(value));
+        return value;
+    }
+
+    static void write_saved_u32(const void* saved_registers, std::size_t offset, DWORD value) {
+        if (saved_registers == nullptr) {
+            return;
+        }
+        auto* base = const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(saved_registers));
+        std::memcpy(base + offset, &value, sizeof(value));
+    }
+
+    static void populate_context_from_saved_registers(const void* saved_registers, CONTEXT& context) {
+        context.Eax = read_saved_u32(saved_registers, k_saved_eax_offset);
+        context.Ecx = read_saved_u32(saved_registers, k_saved_ecx_offset);
+        context.Edx = read_saved_u32(saved_registers, k_saved_edx_offset);
+        context.Ebx = read_saved_u32(saved_registers, k_saved_ebx_offset);
+        context.Ebp = read_saved_u32(saved_registers, k_saved_ebp_offset);
+        context.Esi = read_saved_u32(saved_registers, k_saved_esi_offset);
+        context.Edi = read_saved_u32(saved_registers, k_saved_edi_offset);
+        context.Esp = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(saved_registers) + k_saved_stack_size);
+        context.EFlags = read_saved_u32(saved_registers, k_saved_eflags_offset);
+    }
+
+    static void apply_context_to_saved_registers(const CONTEXT& context, const void* saved_registers) {
+        write_saved_u32(saved_registers, k_saved_eax_offset, context.Eax);
+        write_saved_u32(saved_registers, k_saved_ecx_offset, context.Ecx);
+        write_saved_u32(saved_registers, k_saved_edx_offset, context.Edx);
+        write_saved_u32(saved_registers, k_saved_ebx_offset, context.Ebx);
+        write_saved_u32(saved_registers, k_saved_ebp_offset, context.Ebp);
+        write_saved_u32(saved_registers, k_saved_esi_offset, context.Esi);
+        write_saved_u32(saved_registers, k_saved_edi_offset, context.Edi);
+        write_saved_u32(saved_registers, k_saved_eflags_offset, context.EFlags);
     }
 #endif
 

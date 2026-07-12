@@ -8,6 +8,15 @@
 
 #include <Zydis/Zydis.h>
 
+namespace {
+bool uses_translation_cache(instruction_callback_backend backend) {
+    return backend == instruction_callback_backend::translated_cache ||
+        backend == instruction_callback_backend::cooperative_translation ||
+        backend == instruction_callback_backend::inline_hook ||
+        backend == instruction_callback_backend::guard_page_translation;
+}
+}
+
 bool dbi_framework::initialize(const dbi_framework_options& options) {
     instruction_backend_ = options.instruction_backend;
     set_log_callback(options.log_callback);
@@ -25,6 +34,7 @@ void dbi_framework::set_log_callback(dbi_framework_options::log_callback_type ca
     host_.plugins().set_log_callback(log_callback_);
     dispatcher_code_cache_callbacks_.set_log_callback(log_callback_);
     translated_cache_entry_traps_.set_log_callback(log_callback_);
+    guard_page_entry_traps_.set_log_callback(log_callback_);
 }
 
 plugin_manager& dbi_framework::plugins() {
@@ -124,7 +134,7 @@ bool dbi_framework::install_indirect_redirect(indirect_redirect_record& redirect
     if (redirect.installed) {
         return true;
     }
-    if (instruction_backend_ != instruction_callback_backend::translated_cache ||
+    if (!uses_translation_cache(instruction_backend_) ||
         redirect.target_slot == nullptr ||
         redirect.original_target == 0) {
         return false;
@@ -259,7 +269,7 @@ int dbi_framework::instrument_instruction_with_status(std::uintptr_t address) {
         return instrumentation_status::invalid_address;
     }
 
-    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+    if (uses_translation_cache(instruction_backend_)) {
         for (const std::uintptr_t existing : translated_requested_entries_) {
             if (existing == address) {
                 return instrumentation_status::already_instrumented;
@@ -299,7 +309,7 @@ bool dbi_framework::enable_instruction_callbacks() {
         forward_instruction_hit(pid, inst, ctx);
     };
 
-    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+    if (uses_translation_cache(instruction_backend_)) {
         if (!translated_cache_callbacks_.add_callback(bridge_callback)) {
             plugins().on_process_exit(pid, 1);
             return false;
@@ -315,7 +325,8 @@ bool dbi_framework::enable_instruction_callbacks() {
             }
         }
 
-        if (!translated_requested_entries_.empty()) {
+        if (instruction_backend_ == instruction_callback_backend::translated_cache &&
+            !translated_requested_entries_.empty()) {
             for (const std::uintptr_t entry : translated_requested_entries_) {
                 if (!translated_cache_entry_traps_.instrument_instruction(entry)) {
                     restore_installed_indirect_redirects();
@@ -338,9 +349,42 @@ bool dbi_framework::enable_instruction_callbacks() {
             }
         }
 
+        if (instruction_backend_ == instruction_callback_backend::guard_page_translation &&
+            !translated_requested_entries_.empty()) {
+            for (const std::uintptr_t entry : translated_requested_entries_) {
+                if (!guard_page_entry_traps_.instrument_instruction(entry)) {
+                    restore_installed_indirect_redirects();
+                    translated_cache_callbacks_.reset();
+                    plugins().on_process_exit(pid, 1);
+                    return false;
+                }
+            }
+
+            if (!guard_page_entry_traps_.set_entry_redirect_resolver([this](std::uintptr_t address) -> std::uintptr_t {
+                    return reinterpret_cast<std::uintptr_t>(translated_cache_callbacks_.translate_entry(address));
+                }) ||
+                !guard_page_entry_traps_.install()) {
+                guard_page_entry_traps_.uninstall();
+                restore_installed_indirect_redirects();
+                translated_cache_callbacks_.reset();
+                plugins().on_process_exit(pid, 1);
+                return false;
+            }
+        }
+
+        if (instruction_backend_ == instruction_callback_backend::inline_hook &&
+            !install_inline_hooks()) {
+            restore_installed_indirect_redirects();
+            translated_cache_callbacks_.reset();
+            plugins().on_process_exit(pid, 1);
+            return false;
+        }
+
         for (auto& redirect : indirect_redirects_) {
             if (!install_indirect_redirect(redirect)) {
                 translated_cache_entry_traps_.uninstall();
+                guard_page_entry_traps_.uninstall();
+                restore_inline_hooks();
                 restore_installed_indirect_redirects();
                 translated_cache_callbacks_.reset();
                 plugins().on_process_exit(pid, 1);
@@ -367,15 +411,77 @@ bool dbi_framework::enable_instruction_callbacks() {
 }
 
 const char* dbi_framework::last_instruction_error() const {
-    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
-        return translated_cache_callbacks_.last_error();
+    if (uses_translation_cache(instruction_backend_)) {
+        const char* translated_error = translated_cache_callbacks_.last_error();
+        if (translated_error != nullptr && translated_error[0] != '\0') {
+            return translated_error;
+        }
+        if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+            return translated_cache_entry_traps_.last_error();
+        }
+        if (instruction_backend_ == instruction_callback_backend::guard_page_translation) {
+            return guard_page_entry_traps_.last_error();
+        }
+        if (instruction_backend_ == instruction_callback_backend::inline_hook) {
+            return inline_hook_error_.c_str();
+        }
+        return "";
     }
     return dispatcher_code_cache_callbacks_.last_error();
 }
 
+bool dbi_framework::install_inline_hooks() {
+    inline_hook_error_.clear();
+    inline_hook_patch_ids_.clear();
+    if (translated_requested_entries_.empty()) {
+        return true;
+    }
+    if (!inline_hook_patcher_.use_current_process()) {
+        inline_hook_error_ = "inline hook: could not initialize current-process patcher";
+        return false;
+    }
+
+    for (const std::uintptr_t entry : translated_requested_entries_) {
+        void* translated = translated_cache_callbacks_.translate_entry(entry);
+        if (translated == nullptr) {
+            inline_hook_error_ = "inline hook: target translation failed";
+            restore_inline_hooks();
+            return false;
+        }
+
+        std::uint64_t patch_id = 0;
+        if (!inline_hook_patcher_.write_jump_patch(
+                entry,
+                reinterpret_cast<std::uintptr_t>(translated),
+                patch_id)) {
+            inline_hook_error_ = "inline hook: entry jump installation failed";
+            restore_inline_hooks();
+            return false;
+        }
+        inline_hook_patch_ids_.push_back(patch_id);
+    }
+    return true;
+}
+
+void dbi_framework::restore_inline_hooks() {
+    for (auto it = inline_hook_patch_ids_.rbegin(); it != inline_hook_patch_ids_.rend(); ++it) {
+        inline_hook_patcher_.remove_patch(*it);
+    }
+    inline_hook_patch_ids_.clear();
+    inline_hook_patcher_.detach();
+}
+
 void dbi_framework::disable_instruction_callbacks() {
-    if (instruction_backend_ == instruction_callback_backend::translated_cache) {
-        translated_cache_entry_traps_.uninstall();
+    if (uses_translation_cache(instruction_backend_)) {
+        if (instruction_backend_ == instruction_callback_backend::translated_cache) {
+            translated_cache_entry_traps_.uninstall();
+        }
+        if (instruction_backend_ == instruction_callback_backend::guard_page_translation) {
+            guard_page_entry_traps_.uninstall();
+        }
+        if (instruction_backend_ == instruction_callback_backend::inline_hook) {
+            restore_inline_hooks();
+        }
         restore_installed_indirect_redirects();
         translated_cache_callbacks_.reset();
         translated_requested_entries_.clear();
@@ -396,7 +502,7 @@ void* dbi_framework::translated_entry(std::uintptr_t address) {
 }
 
 bool dbi_framework::redirect_indirect_call_target(void** target_slot, std::uint64_t* out_redirect_id) {
-    if (instruction_backend_ != instruction_callback_backend::translated_cache) {
+    if (!uses_translation_cache(instruction_backend_)) {
         return false;
     }
 

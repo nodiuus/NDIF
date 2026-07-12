@@ -69,7 +69,7 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <OutDir>$(ProjectDir)..\..\..\x64\$(Configuration)\plugins\</OutDir>
+    <OutDir>$(ProjectDir)..\..\..\$(Platform)\$(Configuration)\plugins\</OutDir>
     <TargetName>framework_showcase</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">

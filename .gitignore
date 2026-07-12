@@ -390,3 +390,6 @@ FodyWeavers.xsd
 /test_exe/test_exe.vcxproj
 /test_exe/test_exe.vcxproj.filters
 /hook.log.txt
+CONTRIBUTING.md
+test_dll/Offsets.hpp
+test_dll/main.cpp

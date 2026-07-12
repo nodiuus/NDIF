@@ -8,7 +8,8 @@ Purpose
   - accepts one start command and replies with ACK
 
 Build output
-- `x64\<Configuration>\dbi_agent.dll`
+- `<Platform>\<Configuration>\dbi_agent.dll`
+- Build the agent for the same architecture as the host and target process.
 
 Controller command
 - `DBI.exe -i <pid>`

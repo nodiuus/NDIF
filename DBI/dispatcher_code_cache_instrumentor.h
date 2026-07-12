@@ -92,6 +92,7 @@ public:
         }
 
         std::lock_guard<std::mutex> guard(lock_);
+        last_error_.clear();
         if (installed_) {
             return false;
         }
@@ -224,13 +225,30 @@ private:
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
+        if (pending_control_flow_rearm_) {
+            constexpr DWORD trap_flag = 0x100;
+            context.EFlags &= ~trap_flag;
+            context.Dr6 = 0;
+
+            std::lock_guard<std::mutex> guard(self->lock_);
+            self->write_breakpoints(context);
+            pending_control_flow_rearm_ = false;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
         const std::uintptr_t ip = instruction_pointer(context);
         std::uintptr_t cache_entry = 0;
+        instrumented_instruction control_flow_instruction{};
+        bool control_flow_site = false;
         {
             std::lock_guard<std::mutex> guard(self->lock_);
             const auto it = self->sites_.find(ip);
             if (it != self->sites_.end()) {
                 cache_entry = it->second.cache_entry;
+                if (cache_entry == 0 && it->second.head_instruction.is_control_flow) {
+                    control_flow_instruction = it->second.head_instruction;
+                    control_flow_site = true;
+                }
                 if (self->entry_redirect_resolver_) {
                     const std::uintptr_t redirected = self->entry_redirect_resolver_(ip);
                     if (redirected != 0) {
@@ -243,6 +261,25 @@ private:
         if (cache_entry != 0) {
             context.Dr6 = 0;
             set_instruction_pointer(context, cache_entry);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        if (control_flow_site) {
+            constexpr DWORD trap_flag = 0x100;
+            constexpr DWORD_PTR local_breakpoint_enable_mask =
+                (DWORD_PTR(1) << 0) |
+                (DWORD_PTR(1) << 2) |
+                (DWORD_PTR(1) << 4) |
+                (DWORD_PTR(1) << 6);
+
+            context.Dr6 = 0;
+            context.Dr7 &= ~local_breakpoint_enable_mask;
+            context.EFlags |= trap_flag;
+            pending_control_flow_rearm_ = true;
+
+            for (auto& callback : self->callbacks_) {
+                callback(control_flow_instruction, context);
+            }
             return EXCEPTION_CONTINUE_EXECUTION;
         }
 
@@ -283,15 +320,14 @@ private:
         populate_context_from_saved_registers(saved_registers, context);
 #else
         context.Eip = static_cast<DWORD>(address);
+        populate_context_from_saved_registers(saved_registers, context);
 #endif
 
         for (auto& cb : self->callbacks_) {
             cb(site->head_instruction, context);
         }
 
-#if defined(_M_X64)
         apply_context_to_saved_registers(context, saved_registers);
-#endif
     }
 
 #if defined(_M_X64)
@@ -369,6 +405,57 @@ private:
         write_saved_u64(saved_registers, k_saved_r15_offset, context.R15);
         write_saved_u64(saved_registers, k_saved_rflags_offset, context.EFlags);
     }
+#else
+    static constexpr std::size_t k_saved_edi_offset = 0x00;
+    static constexpr std::size_t k_saved_esi_offset = 0x04;
+    static constexpr std::size_t k_saved_ebp_offset = 0x08;
+    static constexpr std::size_t k_saved_ebx_offset = 0x10;
+    static constexpr std::size_t k_saved_edx_offset = 0x14;
+    static constexpr std::size_t k_saved_ecx_offset = 0x18;
+    static constexpr std::size_t k_saved_eax_offset = 0x1C;
+    static constexpr std::size_t k_saved_eflags_offset = 0x20;
+    static constexpr std::size_t k_saved_stack_size = 0x24;
+
+    static DWORD read_saved_u32(const void* saved_registers, std::size_t offset) {
+        if (saved_registers == nullptr) {
+            return 0;
+        }
+        const auto* base = static_cast<const std::uint8_t*>(saved_registers);
+        DWORD value = 0;
+        std::memcpy(&value, base + offset, sizeof(value));
+        return value;
+    }
+
+    static void write_saved_u32(const void* saved_registers, std::size_t offset, DWORD value) {
+        if (saved_registers == nullptr) {
+            return;
+        }
+        auto* base = const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(saved_registers));
+        std::memcpy(base + offset, &value, sizeof(value));
+    }
+
+    static void populate_context_from_saved_registers(const void* saved_registers, CONTEXT& context) {
+        context.Eax = read_saved_u32(saved_registers, k_saved_eax_offset);
+        context.Ecx = read_saved_u32(saved_registers, k_saved_ecx_offset);
+        context.Edx = read_saved_u32(saved_registers, k_saved_edx_offset);
+        context.Ebx = read_saved_u32(saved_registers, k_saved_ebx_offset);
+        context.Ebp = read_saved_u32(saved_registers, k_saved_ebp_offset);
+        context.Esi = read_saved_u32(saved_registers, k_saved_esi_offset);
+        context.Edi = read_saved_u32(saved_registers, k_saved_edi_offset);
+        context.Esp = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(saved_registers) + k_saved_stack_size);
+        context.EFlags = read_saved_u32(saved_registers, k_saved_eflags_offset);
+    }
+
+    static void apply_context_to_saved_registers(const CONTEXT& context, const void* saved_registers) {
+        write_saved_u32(saved_registers, k_saved_eax_offset, context.Eax);
+        write_saved_u32(saved_registers, k_saved_ecx_offset, context.Ecx);
+        write_saved_u32(saved_registers, k_saved_edx_offset, context.Edx);
+        write_saved_u32(saved_registers, k_saved_ebx_offset, context.Ebx);
+        write_saved_u32(saved_registers, k_saved_ebp_offset, context.Ebp);
+        write_saved_u32(saved_registers, k_saved_esi_offset, context.Esi);
+        write_saved_u32(saved_registers, k_saved_edi_offset, context.Edi);
+        write_saved_u32(saved_registers, k_saved_eflags_offset, context.EFlags);
+    }
 #endif
 
     const cached_site* find_site(std::uintptr_t address) const {
@@ -385,6 +472,13 @@ private:
             return false;
         }
 
+        // Execute-breakpoint entries with control-flow instructions are
+        // handled directly by vectored_handler. Do not relocate them into a
+        // cache block, since that would change their branch semantics.
+        if (out_site.head_instruction.is_control_flow) {
+            return true;
+        }
+
         std::vector<std::uint8_t> prologue{};
         build_callback_prologue(address, prologue);
 
@@ -399,6 +493,7 @@ private:
 
         void* cache = allocate_executable_near(address, cache_blob.size());
         if (cache == nullptr) {
+            last_error_ = "build_site: executable cache allocation failed";
             return false;
         }
 
@@ -406,6 +501,9 @@ private:
         auto* copied_prefix = reinterpret_cast<std::uint8_t*>(cache) + prologue.size();
         const std::uintptr_t copied_prefix_base = reinterpret_cast<std::uintptr_t>(cache) + prologue.size();
         if (!relocate_relative_fields(out_site.entries, out_site.original_bytes, copied_prefix, copied_prefix_base)) {
+            if (last_error_.empty()) {
+                last_error_ = "build_site: relative relocation failed";
+            }
             VirtualFree(cache, 0, MEM_RELEASE);
             return false;
         }
@@ -437,18 +535,27 @@ private:
             bool is_relative = false;
             ZydisDecodedInstruction zydis{};
             if (!decode_one(cursor, decoded, is_relative, zydis)) {
+                if (last_error_.empty()) {
+                    last_error_ = "decode_patchable_prefix: instruction decode failed";
+                }
                 return false;
             }
             if (decoded_count == 0) {
                 out_head = decoded;
             }
 
-            // Guard-page redirection enters the cache at the requested
-            // instruction, runs that relocated instruction, then jumps back to
-            // the original continuation. Keep control-flow instructions out
-            // until branch relocation is implemented deliberately.
             if (decoded.is_control_flow) {
-                return false;
+                // Keep the original instruction in the site record. The
+                // hardware-breakpoint handler will single-step it in place.
+                decoded_site_entry entry{};
+                entry.inst = decoded;
+                entry.decoded = zydis;
+                entry.block_offset = total;
+                entry.has_relative_encoding = is_relative;
+                out_entries.push_back(entry);
+                total += decoded.length;
+                cursor += decoded.length;
+                break;
             }
 
             decoded_site_entry entry{};
@@ -472,6 +579,7 @@ private:
                 static_cast<SIZE_T>(total),
                 &read) ||
             read != static_cast<SIZE_T>(total)) {
+            last_error_ = "decode_patchable_prefix: code bytes are unreadable";
             out_bytes.clear();
             return false;
         }
@@ -490,14 +598,17 @@ private:
         is_relative = false;
         out_decoded = {};
         if (address == 0) {
+            last_error_ = "decode_one: address is zero";
             return false;
         }
 
         MEMORY_BASIC_INFORMATION mbi{};
         if (VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+            last_error_ = "decode_one: VirtualQuery failed";
             return false;
         }
         if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) != 0 || (mbi.Protect & PAGE_NOACCESS) != 0) {
+            last_error_ = "decode_one: memory is not committed or is protected";
             return false;
         }
 
@@ -508,22 +619,26 @@ private:
             protect == PAGE_EXECUTE_READWRITE ||
             protect == PAGE_EXECUTE_WRITECOPY;
         if (!executable) {
+            last_error_ = "decode_one: memory is not executable";
             return false;
         }
 
         std::uint8_t buffer[32]{};
         SIZE_T read = 0;
         if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), buffer, sizeof(buffer), &read) || read == 0) {
+            last_error_ = "decode_one: ReadProcessMemory failed";
             return false;
         }
 
         ZydisDecoder decoder;
 #if defined(_M_X64)
         if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+            last_error_ = "decode_one: Zydis x64 initialization failed";
             return false;
         }
 #else
         if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32))) {
+            last_error_ = "decode_one: Zydis x86 initialization failed";
             return false;
         }
 #endif
@@ -536,6 +651,7 @@ private:
         status = ZydisDecoderDecodeBuffer(&decoder, buffer, read, &out_decoded);
 #endif
         if (!ZYAN_SUCCESS(status) || out_decoded.length == 0) {
+            last_error_ = "decode_one: instruction bytes are not decodable";
             return false;
         }
 
@@ -627,14 +743,14 @@ private:
 #else
         out.push_back(0x9C); // pushfd
         out.push_back(0x60); // pushad
+        out.insert(out.end(), {0x89, 0xE0}); // mov eax, esp
+        out.push_back(0x50); // push eax ; saved register frame
         out.push_back(0x68); // push imm32
         append_u32(static_cast<std::uint32_t>(site_address), out);
-        const std::uintptr_t call_site = 0; // fixed up by absolute push/ret style below.
-        (void)call_site;
         out.push_back(0xB8); // mov eax, imm32
-        append_u32(reinterpret_cast<std::uint32_t>(&dispatcher_code_cache_instrumentor::dispatch_site_hit), out);
+        append_u32(static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&dispatcher_code_cache_instrumentor::dispatch_site_hit)), out);
         out.insert(out.end(), {0xFF, 0xD0}); // call eax
-        out.insert(out.end(), {0x83, 0xC4, 0x04}); // add esp, 4
+        out.insert(out.end(), {0x83, 0xC4, 0x08}); // add esp, 8
         out.push_back(0x61); // popad
         out.push_back(0x9D); // popfd
 #endif
@@ -1105,9 +1221,11 @@ private:
             message,
             sizeof(message),
             _TRUNCATE,
-            "[dispatcher_code_cache] instrument_instruction failed stage=%s address=0x%llx\n",
+            "[dispatcher_code_cache] instrument_instruction failed stage=%s address=0x%llx reason=%s\n",
             stage,
-            static_cast<unsigned long long>(address));
+            static_cast<unsigned long long>(address),
+            last_error_.empty() ? "unspecified" : last_error_.c_str());
+        last_error_ = message;
         emit_log(message);
     }
 
@@ -1162,7 +1280,7 @@ private:
     std::vector<callback_type> callbacks_{};
     entry_redirect_resolver_type entry_redirect_resolver_{};
     log_callback_type log_callback_{};
-    std::string last_error_{};
+    mutable std::string last_error_{};
     void* veh_handle_{nullptr};
     HANDLE sync_thread_{nullptr};
     HANDLE sync_stop_event_{nullptr};
@@ -1170,4 +1288,5 @@ private:
     mutable std::mutex lock_{};
 
     inline static dispatcher_code_cache_instrumentor* active_instance_{nullptr};
+    inline static thread_local bool pending_control_flow_rearm_{false};
 };

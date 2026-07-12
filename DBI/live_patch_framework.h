@@ -36,6 +36,11 @@ public:
     bool write_patch(std::uintptr_t address, const std::vector<std::uint8_t>& bytes, std::uint64_t& patch_id);
     bool write_nop_patch(std::uintptr_t address, std::size_t count, std::uint64_t& patch_id);
     bool write_int3_patch(std::uintptr_t address, std::size_t count, std::uint64_t& patch_id);
+    // Replaces a whole-instruction prefix with a jump to destination. Unlike
+    // write_detour_patch, no trampoline is emitted and overwritten instructions
+    // are not replayed. This is intended for callers that already own a
+    // translated/replacement destination.
+    bool write_jump_patch(std::uintptr_t address, std::uintptr_t destination, std::uint64_t& patch_id);
     bool write_detour_patch(std::uintptr_t address, const std::vector<std::uint8_t>& injected_instructions, std::uint64_t& patch_id);
 
     bool remove_patch(std::uint64_t patch_id);
@@ -47,6 +52,7 @@ private:
     bool write_protected(std::uintptr_t address, const std::uint8_t* bytes, std::size_t size) const;
     bool read_bytes(std::uintptr_t address, std::size_t size, std::vector<std::uint8_t>& out_bytes) const;
     bool build_jump(std::uintptr_t src, std::uintptr_t dst, std::vector<std::uint8_t>& jump_bytes) const;
+    bool decode_span(std::uintptr_t address, std::size_t min_size, std::size_t& span_size, std::vector<std::uint8_t>& span_bytes) const;
     bool decode_safe_span(std::uintptr_t address, std::size_t min_size, std::size_t& span_size, std::vector<std::uint8_t>& span_bytes) const;
     bool suspend_target_threads(std::vector<HANDLE>& suspended_handles) const;
     void resume_target_threads(std::vector<HANDLE>& suspended_handles) const;

@@ -2,7 +2,7 @@
 
 NDIF stands for "Nisan's Dynamic Instrumentation Framework" (yes I skipped the "binary" part for a cooler name). 
 
-This repository is a public alpha for Windows x64 dynamic binary instrumentation experiments.
+This repository is a public alpha for Windows x64 and Win32 dynamic binary instrumentation experiments.
 
 The alpha is intentionally small: it ships the DBI core/CLI, one sample plugin, and the minimal in-target agent DLL. Larger research projects and detector zoos are kept out of the public solution for now.
 
@@ -23,10 +23,10 @@ Not included in the public alpha solution:
 
 ## Requirements
 
-- Windows 10/11 x64
+- Windows 10/11
 - Visual Studio 2026 or newer with C++ desktop workload
 - vcpkg manifest integration
-- x64 build configuration
+- x64 or Win32 build configuration
 
 Dependencies are declared in `vcpkg.json`:
 
@@ -41,6 +41,7 @@ From a Developer PowerShell:
 
 ```powershell
 msbuild DBI.slnx /p:Configuration=Debug /p:Platform=x64 /m
+msbuild DBI.slnx /p:Configuration=Debug /p:Platform=Win32 /m
 ```
 
 If `msbuild` is not on PATH, launch the command from a Visual Studio developer shell or use the full MSBuild path from `vswhere`.
@@ -50,6 +51,9 @@ Expected outputs:
 - `DBI\x64\Debug\DBI.exe`
 - `x64\Debug\plugins\framework_showcase.dll`
 - `x64\Debug\dbi_agent.dll`
+- `DBI\Win32\Debug\DBI.exe`
+- `Win32\Debug\plugins\framework_showcase.dll`
+- `Win32\Debug\dbi_agent.dll`
 
 ## CLI Usage
 
@@ -58,6 +62,9 @@ Basic forms:
 ```powershell
 DBI.exe <target.exe> [args...]
 DBI.exe --instruction-callback-demo
+DBI.exe --cooperative-callback-demo
+DBI.exe --inline-hook-demo
+DBI.exe --guard-page-demo
 DBI.exe --dispatcher-callback-demo
 DBI.exe --indirect-redirect-demo
 DBI.exe --translated-cache-demo
@@ -81,9 +88,12 @@ Agent workflow:
 DBI.exe -i <pid>
 DBI.exe -i <pid> <section_name>
 DBI.exe -i <pid> <module_name> <section_name>
+DBI.exe --staged-agent <target.exe> [args...]
 ```
 
 The current agent is an MVP handshake path: it connects to `\\.\pipe\dbi_agent_<pid>`, sends a hello/version message, accepts one start command, and replies with ACK.
+
+`--staged-agent` is the cooperative post-initialization backend. It launches the target normally without `DEBUG_PROCESS`, waits for the main module plus a loader settle window, injects `dbi_agent.dll`, validates the versioned pipe handshake, and then sends the instrumentation start request. The reusable API is `staged_agent_backend` in `DBI/staged_agent_backend.*`.
 
 ## Core API Shape
 
@@ -93,6 +103,7 @@ Primary public C++ surfaces live under `DBI/`:
 - `basic_block_code_cache.h`: translated basic-block cache prototype for cache-owned function execution.
 - `dynamic_binary_instrumentor.*`: in-process instrumentation coordinator.
 - `dispatcher_code_cache_instrumentor.h`: non-mutating hardware-breakpoint redirect backend. Registered addresses execute through generated cache blocks while the original bytes stay readable and intact.
+- `guard_page_entry_trap.h`: non-mutating PAGE_GUARD entry backend for redirecting selected native entries into the translated cache without debug registers or code-byte patches.
 - `external_process_instrumentor.*`: debugger-driven external process instrumentation.
 - `live_patch_framework.*`: host-side patch helper exposed to plugins.
 - `plugin_api.h`: stable C ABI for plugins.
@@ -100,6 +111,12 @@ Primary public C++ surfaces live under `DBI/`:
 - `dbi_host.*`: host wrapper around plugin manager and default plugin discovery.
 
 The default in-process instruction callback engine is now the translated basic-block cache. Registered addresses enter the cache through a VEH/debug-register entry trap that redirects RIP into `basic_block_code_cache` while leaving original instruction bytes untouched. Callers can also explicitly enter through `translated_function<T>()` / `translated_entry()` or redirect an existing mutable code-pointer slot.
+
+For environments where debugger-style entry traps are not appropriate, select `instruction_callback_backend::cooperative_translation`. It uses the same translated basic-block cache and callbacks but never installs a VEH entry trap, debug registers, software breakpoints, or a debugger connection. Native calls are intentionally unaffected; callers must enter through `translated_function<T>()` / `translated_entry()` or register a mutable pointer slot with `redirect_indirect_call_target()`.
+
+Select `instruction_callback_backend::inline_hook` to redirect registered native entries without VEH or debug registers. NDIF translates each target first, then replaces a whole-instruction entry prefix with a register-preserving jump into the translated cache. Partial installation is rolled back, peer threads are suspended while entry bytes change, and `disable_instruction_callbacks()` restores every original prefix before releasing translated code. On x64 a five-byte relative jump is used when possible, with a 14-byte RIP-indirect absolute jump as the fallback; Win32 uses a five-byte relative jump.
+
+Select `instruction_callback_backend::guard_page_translation` to redirect registered native entries through `PAGE_GUARD` faults. NDIF translates each target first, installs a VEH, marks only the containing pages with `PAGE_GUARD`, and redirects exact instruction-pointer matches into `basic_block_code_cache`. Original instruction bytes are not modified and no debug registers are used. The tradeoff is that page protections, guard faults, VEH registration, and brief trap-flag rearm windows are observable.
 
 For call sites that already use a mutable code-pointer boundary, callers can register a pointer slot with `redirect_indirect_call_target()` / `redirect_indirect_function<T>()`. When callbacks are enabled, NDIF translates the slot's current destination and replaces only the pointer slot with the cache entry; the caller's instruction bytes are left untouched. `restore_indirect_redirect()` or `disable_instruction_callbacks()` restores the original slot value.
 
@@ -123,11 +140,13 @@ Commands:
 ## Known Limitations
 
 - Public alpha, not a stable API promise.
-- Windows x64 is the real target. x86 project configurations may exist but are not the alpha support target.
+- x64 and Win32 are supported build targets. Host, plugins, injected agent DLLs, and instrumented targets must use the same architecture.
 - The default translated-cache backend observes explicit translated entrypoints, redirected pointer slots, and up to four registered native entry-trap addresses. It is not full-process transparent DBT for arbitrary already-running original code.
+- The inline-hook backend mutates registered function entries and therefore can be detected by code-integrity checks. Setup and teardown must occur while no caller is executing inside an overwritten entry prefix.
+- The guard-page backend leaves code bytes intact but changes page protections and relies on one-shot guard faults plus single-step rearming for non-target accesses on guarded pages.
 - Indirect pointer-slot redirects require an existing mutable function pointer, callback slot, vtable/IAT-like entry, or equivalent boundary. They do not redirect hardcoded direct calls by themselves.
 - The legacy hardware-breakpoint dispatcher instruments up to four explicit addresses per thread, not full process-wide basic-block translation.
 - The translated basic-block cache is an early prototype. It supports ordinary instructions, returns, and direct conditional/unconditional branches, including simple backward branches; unsupported indirect control flow can still leave the cache.
-- Callback `CONTEXT` includes x64 integer registers and flags. Edits to general-purpose registers and flags are applied before relocated bytes resume; edits to `RIP`/`RSP` are not applied yet.
+- Callback `CONTEXT` includes native integer registers and flags for x64 and Win32. Edits to general-purpose registers and flags are applied before relocated bytes resume; edits to `RIP`/`RSP` or `EIP`/`ESP` are not applied yet.
 - Some injection/agent paths are experimental and should be treated as lab tooling.
 - Build/test coverage is manual right now; CI is not wired yet.

@@ -5,7 +5,9 @@
 #include "dynamic_binary_instrumentor.h"
 #include "dispatcher_code_cache_instrumentor.h"
 #include "external_process_instrumentor.h"
+#include "guard_page_entry_trap.h"
 #include "live_patch_framework.h"
+#include "staged_agent_backend.h"
 
 #include <Windows.h>
 
@@ -27,6 +29,19 @@ enum instrumentation_status {
 
 enum class instruction_callback_backend {
     translated_cache,
+    // Cooperative-only translation. Registered native addresses are translated,
+    // but native execution is never trapped or redirected automatically. Enter
+    // through translated_entry()/translated_function() or a registered pointer
+    // slot. This backend installs no VEH, debug registers, or INT3 breakpoints.
+    cooperative_translation,
+    // Transparently redirects registered native entries into the translated
+    // cache by overwriting a whole-instruction prefix with an inline jump.
+    // Original bytes are restored when callbacks are disabled.
+    inline_hook,
+    // Transparently redirects registered native entries into the translated
+    // cache through PAGE_GUARD + VEH traps. Original code bytes are untouched,
+    // and no debug registers are used.
+    guard_page_translation,
     dispatcher_code_cache
 };
 
@@ -92,10 +107,10 @@ public:
         DWORD timeout_ms,
         external_instrumentation_result& out_result);
 
-    // In-process instruction callbacks. The default backend is translated-cache
-    // execution: registered addresses enter the basic-block cache through a
-    // VEH/debug-register entry trap, while translated_function<T>() and
-    // pointer-slot redirects can enter directly.
+    // In-process instruction callbacks. translated_cache transparently enters
+    // registered addresses through a VEH/debug-register entry trap.
+    // cooperative_translation only permits explicit translated entrypoints and
+    // pointer-slot redirects and never installs a native entry trap.
     int instrument_instruction_with_status(std::uintptr_t address);
     bool instrument_instruction(std::uintptr_t address);
     bool add_instruction_callback(std::function<void(CONTEXT& ctx, std::uintptr_t ip)> callback);
@@ -130,6 +145,8 @@ private:
     bool read_pointer_slot(void** target_slot, std::uintptr_t& value) const;
     bool install_indirect_redirect(indirect_redirect_record& redirect);
     void restore_installed_indirect_redirects();
+    bool install_inline_hooks();
+    void restore_inline_hooks();
     void forward_instruction_hit(DWORD pid, const instrumented_instruction& inst, CONTEXT& ctx);
 
     dbi_host host_{};
@@ -137,12 +154,16 @@ private:
     dynamic_binary_instrumentor self_instrumentor_{};
     dispatcher_code_cache_instrumentor dispatcher_code_cache_callbacks_{};
     dispatcher_code_cache_instrumentor translated_cache_entry_traps_{};
+    guard_page_entry_trap guard_page_entry_traps_{};
     basic_block_code_cache translated_cache_callbacks_{};
     std::vector<std::uintptr_t> translated_requested_entries_{};
     std::vector<indirect_redirect_record> indirect_redirects_{};
+    std::vector<std::uint64_t> inline_hook_patch_ids_{};
     std::vector<std::function<void(CONTEXT&, std::uintptr_t)>> instruction_callbacks_user_{};
     external_process_instrumentor external_instrumentor_{};
     live_patch_framework patcher_{};
+    live_patch_framework inline_hook_patcher_{};
+    std::string inline_hook_error_{};
     std::uint64_t next_indirect_redirect_id_{1};
     bool instruction_callbacks_enabled_{false};
     dbi_framework_options::log_callback_type log_callback_{};

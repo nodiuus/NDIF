@@ -50,6 +50,9 @@
     <ClInclude Include="dispatcher_code_cache_instrumentor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="guard_page_entry_trap.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="external_process_instrumentor.h">
       <Filter>Header Files</Filter>
     </ClInclude>

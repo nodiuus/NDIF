@@ -4,12 +4,13 @@ NDIF is currently a public alpha. Contributions are welcome, but keep changes sm
 
 ## Development Setup
 
-Use Windows x64 with Visual Studio C++ tooling and vcpkg manifest mode.
+Use Windows with Visual Studio C++ tooling and vcpkg manifest mode.
 
 Build:
 
 ```powershell
 msbuild DBI.slnx /p:Configuration=Debug /p:Platform=x64 /m
+msbuild DBI.slnx /p:Configuration=Debug /p:Platform=Win32 /m
 ```
 
 ## Pull Requests

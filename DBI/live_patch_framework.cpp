@@ -9,6 +9,9 @@
 #include <limits>
 #include <vector>
 
+#undef min
+#undef max
+
 namespace {
 constexpr DWORD process_suspend_resume_access = 0x0800;
 }
@@ -107,6 +110,52 @@ bool live_patch_framework::write_int3_patch(std::uintptr_t address, std::size_t 
     return write_patch(address, bytes, patch_id);
 }
 
+bool live_patch_framework::write_jump_patch(
+    std::uintptr_t address,
+    std::uintptr_t destination,
+    std::uint64_t& patch_id) {
+
+    std::lock_guard<std::mutex> guard(lock_);
+    if (process_handle_ == nullptr || address == 0 || destination == 0 || address == destination) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> jump{};
+    if (!build_jump(address, destination, jump)) {
+        return false;
+    }
+
+    std::size_t overwritten_size = 0;
+    std::vector<std::uint8_t> original{};
+    if (!decode_span(address, jump.size(), overwritten_size, original)) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> patch_bytes = jump;
+    patch_bytes.insert(patch_bytes.end(), overwritten_size - jump.size(), 0x90);
+
+    std::vector<HANDLE> suspended_threads{};
+    if (!suspend_target_threads(suspended_threads)) {
+        return false;
+    }
+    const bool patched = write_protected(address, patch_bytes.data(), patch_bytes.size());
+    resume_target_threads(suspended_threads);
+    if (!patched) {
+        return false;
+    }
+
+    live_patch_record record{};
+    record.id = next_patch_id_++;
+    record.address = address;
+    record.original_bytes = std::move(original);
+    record.patched_bytes = std::move(patch_bytes);
+    record.enabled = true;
+
+    patch_id = record.id;
+    patches_.try_emplace(record.id, std::move(record));
+    return true;
+}
+
 bool live_patch_framework::write_detour_patch(std::uintptr_t address, const std::vector<std::uint8_t>& injected_instructions, std::uint64_t& patch_id) {
     std::lock_guard<std::mutex> guard(lock_);
     if (process_handle_ == nullptr || address == 0) {
@@ -117,6 +166,11 @@ bool live_patch_framework::write_detour_patch(std::uintptr_t address, const std:
     if (!build_jump(address, address, jump_to_trampoline)) {
         return false;
     }
+#if defined(_M_X64)
+    // VirtualAllocEx is not guaranteed to place the trampoline within rel32
+    // range, so reserve enough source instructions for the absolute fallback.
+    jump_to_trampoline.resize(14, 0x90);
+#endif
 
     std::size_t stolen_size = 0;
     std::vector<std::uint8_t> stolen_bytes{};
@@ -292,17 +346,24 @@ bool live_patch_framework::build_jump(std::uintptr_t src, std::uintptr_t dst, st
     jump_bytes.clear();
 
 #if defined(_M_X64)
-    jump_bytes.reserve(12);
-    jump_bytes.push_back(0x48);
-    jump_bytes.push_back(0xB8);
+    const std::int64_t rel = static_cast<std::int64_t>(dst) - static_cast<std::int64_t>(src + 5);
+    if (rel >= std::numeric_limits<std::int32_t>::min() && rel <= std::numeric_limits<std::int32_t>::max()) {
+        jump_bytes.reserve(5);
+        jump_bytes.push_back(0xE9);
+        const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+        for (std::size_t i = 0; i < sizeof(rel32); ++i) {
+            jump_bytes.push_back(static_cast<std::uint8_t>((static_cast<std::uint32_t>(rel32) >> (i * 8)) & 0xFF));
+        }
+        return true;
+    }
 
+    // jmp qword ptr [rip+0]; <absolute address>. This preserves every GPR,
+    // unlike the common mov rax, imm64 / jmp rax sequence.
+    jump_bytes = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
     const std::uint64_t target = static_cast<std::uint64_t>(dst);
     for (std::size_t i = 0; i < sizeof(target); ++i) {
         jump_bytes.push_back(static_cast<std::uint8_t>((target >> (i * 8)) & 0xFF));
     }
-
-    jump_bytes.push_back(0xFF);
-    jump_bytes.push_back(0xE0);
 #else
     const std::int64_t rel = static_cast<std::int64_t>(dst) - static_cast<std::int64_t>(src + 5);
     if (rel < std::numeric_limits<std::int32_t>::min() || rel > std::numeric_limits<std::int32_t>::max()) {
@@ -317,6 +378,67 @@ bool live_patch_framework::build_jump(std::uintptr_t src, std::uintptr_t dst, st
     }
 #endif
 
+    return true;
+}
+
+bool live_patch_framework::decode_span(
+    std::uintptr_t address,
+    std::size_t min_size,
+    std::size_t& span_size,
+    std::vector<std::uint8_t>& span_bytes) const {
+
+    std::size_t decode_window = std::max<std::size_t>(min_size + ZYDIS_MAX_INSTRUCTION_LENGTH, 128);
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQueryEx(process_handle_, reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+    const std::uintptr_t region_end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (region_end <= address) {
+        return false;
+    }
+    decode_window = std::min<std::size_t>(decode_window, region_end - address);
+    if (decode_window < min_size) {
+        return false;
+    }
+    std::vector<std::uint8_t> code{};
+    if (!read_bytes(address, decode_window, code)) {
+        return false;
+    }
+
+    ZydisDecoder decoder;
+#if defined(_M_X64)
+    if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+        return false;
+    }
+#else
+    if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32))) {
+        return false;
+    }
+#endif
+
+    std::size_t offset = 0;
+    while (offset < code.size() && offset < min_size) {
+        ZydisDecodedInstruction instruction{};
+        ZyanStatus status{};
+#if defined(ZYDIS_VERSION) && (ZYDIS_VERSION_MAJOR(ZYDIS_VERSION) >= 4)
+        ZydisDecoderContext context{};
+        status = ZydisDecoderDecodeInstruction(&decoder, &context, code.data() + offset, code.size() - offset, &instruction);
+#else
+        status = ZydisDecoderDecodeBuffer(&decoder, code.data() + offset, code.size() - offset, &instruction);
+#endif
+        if (!ZYAN_SUCCESS(status) || instruction.length == 0) {
+            return false;
+        }
+        offset += instruction.length;
+    }
+
+    if (offset < min_size) {
+        return false;
+    }
+    span_size = offset;
+    span_bytes.assign(code.begin(), code.begin() + static_cast<std::ptrdiff_t>(offset));
     return true;
 }
 

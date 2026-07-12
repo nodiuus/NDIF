@@ -7,6 +7,7 @@
 #include "core/dbi_core_version.h"
 #include "core/dbi_ipc_protocol.h"
 #include "injection.h"
+#include "staged_agent_backend.h"
 
 #include <algorithm>
 #include <cstring>
@@ -550,7 +551,6 @@ int run_in_process_demo(plugin_manager& plugins) {
         const auto disp = *reinterpret_cast<volatile std::int32_t*>(demo_entry + 1);
         demo_start = demo_entry + 5 + static_cast<std::int64_t>(disp);
     }
-
     constexpr std::size_t demo_region_size = 256;
     if (!dbii.add_region(reinterpret_cast<void*>(demo_start), demo_region_size)) {
         std::cerr << "failed to register target region\n";
@@ -872,6 +872,7 @@ int run_instruction_callback_demo(instruction_callback_backend backend = instruc
         const auto disp = *reinterpret_cast<volatile std::int32_t*>(demo_entry + 1);
         demo_start = demo_entry + 5 + static_cast<std::int64_t>(disp);
     }
+    const int restore_probe_expected = demo_target(11);
 
     std::size_t hits = 0;
     if (!framework.instrument_instruction(demo_start)) {
@@ -893,9 +894,11 @@ int run_instruction_callback_demo(instruction_callback_backend backend = instruc
     }
 
     int total = 0;
-    const bool translated_backend = backend == instruction_callback_backend::translated_cache;
+    const bool explicit_translated_entry =
+        backend == instruction_callback_backend::translated_cache ||
+        backend == instruction_callback_backend::cooperative_translation;
     translated_demo_fn translated = nullptr;
-    if (translated_backend) {
+    if (explicit_translated_entry) {
         translated = framework.translated_function<translated_demo_fn>(demo_start);
         if (translated == nullptr) {
             std::cerr << "instruction callback demo: translated entry failed: " << framework.last_instruction_error() << "\n";
@@ -904,13 +907,40 @@ int run_instruction_callback_demo(instruction_callback_backend backend = instruc
         }
     }
 
+    if (backend == instruction_callback_backend::cooperative_translation) {
+        const int native_probe = demo_target(7);
+        if (hits != 0) {
+            std::cerr << "cooperative translation demo: native entry was unexpectedly trapped\n";
+            framework.disable_instruction_callbacks();
+            return 1;
+        }
+        std::cout << "cooperative translation demo: native entry untouched, result="
+                  << native_probe << "\n";
+    }
+
     for (int i = 0; i < 64; ++i) {
-        total += translated_backend ? translated(i) : demo_target(i);
+        total += explicit_translated_entry ? translated(i) : demo_target(i);
     }
 
     framework.disable_instruction_callbacks();
 
-    std::cout << "instruction callback demo: backend=" << (translated_backend ? "translated_cache" : "dispatcher_code_cache")
+    const std::size_t hits_before_restore_probe = hits;
+    const int restore_probe_actual = demo_target(11);
+    if (restore_probe_actual != restore_probe_expected || hits != hits_before_restore_probe) {
+        std::cerr << "instruction callback demo: backend did not restore native entry cleanly\n";
+        return 1;
+    }
+
+    const char* backend_name = backend == instruction_callback_backend::translated_cache
+        ? "translated_cache"
+        : backend == instruction_callback_backend::cooperative_translation
+            ? "cooperative_translation"
+            : backend == instruction_callback_backend::inline_hook
+                ? "inline_hook"
+                : backend == instruction_callback_backend::guard_page_translation
+                    ? "guard_page_translation"
+                    : "dispatcher_code_cache";
+    std::cout << "instruction callback demo: backend=" << backend_name
               << " total=" << total << " hits=" << hits << "\n";
     std::cout << "demo_target entry=0x" << std::hex << demo_entry << " start=0x" << demo_start << std::dec << "\n";
     return hits == 64 ? 0 : 1;
@@ -920,7 +950,7 @@ int run_indirect_redirect_demo() {
     dbi_framework framework{};
     dbi_framework_options options{};
     options.enable_plugins = false;
-    options.instruction_backend = instruction_callback_backend::translated_cache;
+    options.instruction_backend = instruction_callback_backend::cooperative_translation;
     if (!framework.initialize(options)) {
         std::cerr << "indirect redirect demo: framework init failed\n";
         return 1;
@@ -1159,6 +1189,39 @@ int run_launch_suspended_inject(int argc, wchar_t* argv[]) {
                << L" ok=" << (ok ? L"true" : L"false") << L"\n";
     return ok ? 0 : 1;
 }
+
+int run_staged_agent(int argc, wchar_t* argv[]) {
+    if (argc < 2) {
+        std::wcerr << L"usage: DBI.exe --staged-agent <target.exe> [target args...]\n";
+        return 1;
+    }
+
+    staged_agent_options options{};
+    options.executable_path = argv[1];
+    options.agent_dll_path = resolve_agent_dll_path();
+    for (int i = 2; i < argc; ++i) {
+        options.arguments.emplace_back(argv[i]);
+    }
+    options.on_event = [](const staged_agent_event& event) {
+        std::cout << "staged-agent phase=" << static_cast<int>(event.phase)
+                  << " pid=" << event.pid
+                  << " message=" << event.message << "\n";
+    };
+
+    staged_agent_backend backend{};
+    staged_agent_result result{};
+    const bool ok = backend.run(options, result);
+    if (!ok) {
+        std::cerr << "staged-agent failed: pid=" << result.pid
+                  << " win32_error=" << result.win32_error << "\n";
+        return 1;
+    }
+
+    std::cout << "staged-agent ready: pid=" << result.pid
+              << " agent_status=" << result.agent_status
+              << " message=" << result.agent_message << "\n";
+    return 0;
+}
 } // namespace
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -1214,6 +1277,9 @@ int wmain(int argc, wchar_t* argv[]) {
     if (arg_is(cmd, {L"--launch-suspended-inject", L"--lsi"})) {
         return run_launch_suspended_inject(argc - index, argv + index);
     }
+    if (arg_is(cmd, {L"--staged-agent", L"--stage"})) {
+        return run_staged_agent(argc - index, argv + index);
+    }
     if (arg_is(cmd, {L"--patch-bytes", L"--pbytes"})) {
         return run_patch_bytes(argc - index, argv + index);
     }
@@ -1228,6 +1294,15 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     if (arg_is(cmd, {L"--dispatcher-callback-demo"})) {
         return run_instruction_callback_demo(instruction_callback_backend::dispatcher_code_cache);
+    }
+    if (arg_is(cmd, {L"--cooperative-callback-demo"})) {
+        return run_instruction_callback_demo(instruction_callback_backend::cooperative_translation);
+    }
+    if (arg_is(cmd, {L"--inline-hook-demo"})) {
+        return run_instruction_callback_demo(instruction_callback_backend::inline_hook);
+    }
+    if (arg_is(cmd, {L"--guard-page-demo", L"--guard-page-callback-demo"})) {
+        return run_instruction_callback_demo(instruction_callback_backend::guard_page_translation);
     }
     if (arg_is(cmd, {L"--indirect-redirect-demo"})) {
         return run_indirect_redirect_demo();
@@ -1247,10 +1322,14 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"       DBI.exe -i <pid> <section_name>\n";
     std::wcout << L"       DBI.exe -i <pid> <module_name> <section_name>\n";
     std::wcout << L"       DBI.exe --lsi <target.exe> [target args...]       (# uses Loader.exe <pid>)\n";
+    std::wcout << L"       DBI.exe --staged-agent <target.exe> [target args...] (# normal launch, delayed cooperative agent)\n";
     std::wcout << L"       DBI.exe --patch-bytes <pid> <address> <hexbytes>\n";
     std::wcout << L"       DBI.exe --patch-nop <pid> <address> <count>\n";
     std::wcout << L"       DBI.exe --self-patch-demo\n";
     std::wcout << L"       DBI.exe --instruction-callback-demo          (# translated-cache backend)\n";
+    std::wcout << L"       DBI.exe --cooperative-callback-demo          (# explicit-entry translation, no traps)\n";
+    std::wcout << L"       DBI.exe --inline-hook-demo                   (# native entry inline-hook backend)\n";
+    std::wcout << L"       DBI.exe --guard-page-demo                   (# PAGE_GUARD entry-trap backend)\n";
     std::wcout << L"       DBI.exe --dispatcher-callback-demo           (# legacy dispatcher backend)\n";
     std::wcout << L"       DBI.exe --indirect-redirect-demo\n";
     std::wcout << L"       DBI.exe --translated-cache-demo\n";
